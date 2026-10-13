@@ -1,6 +1,5 @@
 # Dependencies
 node_modules/
-<<<<<<< HEAD
 .pnp
 .pnp.js
 .yarn/*
@@ -98,9 +97,7 @@ eas-*.log
 Thumbs.db
 ehthumbs.db
 desktop.ini
-=======
 
 # Build / test output
 dist/
 coverage/
->>>>>>> master
