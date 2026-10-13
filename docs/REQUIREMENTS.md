@@ -1,7 +1,7 @@
 # PersonalExpendiure — Product Requirements (v1)
 
 Status: draft, agreed during design interview.
-Last updated: 2026-10-12
+Last updated: 2026-10-14
 
 Companion to [`ARCHITECTURE.md`](./ARCHITECTURE.md), which covers *how* this is
 built. This document covers *what* it does and *why*. If the two ever disagree,
@@ -49,7 +49,7 @@ The app is public and multi-tenant: strangers sign up, each with isolated data.
 | Role | Description | Capabilities |
 | --- | --- | --- |
 | **Member** (the default) | A signed-up person. | Everything personal; create expenses in periods they belong to. |
-| **Manager** | A member of exactly one or more periods, marked as such. | Everything a member can do, **plus** edit or delete any expense in their periods, manage the roster, and transfer the role. |
+| **Manager** | A member of exactly one or more periods, marked as such. | Everything a member can do, **plus** edit or delete any expense in their periods, and transfer the manager role. The roster is fixed in v1 (FR-4.4), so “manage the roster” is not a v1 capability. |
 | **Outsider** | Any other signed-up user. | No visibility into your data at all. |
 
 A person is a Member in one context and a Manager in another. There is no
@@ -64,7 +64,8 @@ A person is a Member in one context and a Manager in another. There is no
 1. Sign up with email and password.
 2. Verify the email.
 3. **One onboarding screen:** choose a base currency, confirm the starter
-   category list.
+   category list. The IANA time zone is taken from the device (used for "today"
+   and month bounds) and can be changed later in settings.
 4. Land on an empty "this month" view that is clearly empty rather than
    broken.
 
@@ -87,8 +88,9 @@ the user on data that isn't theirs.
 
 ### 3.4 Record a shared cost
 
-1. Inside the period, tap add. Amount, date, who paid, category (optional),
-   note (optional).
+1. Inside the period, tap add. Amount, date, who paid, optional note.
+   Shared expenses are uncategorised in v1 — categories are private to each
+   user (FR-2.5), so a period cannot show another person's category list.
 2. Choose who it is split between — everyone by default, with the option to
    exclude specific people or type an exact amount per person.
 3. The app shows each person's share before saving, and the shares must add up
@@ -117,7 +119,8 @@ transactions, and does **not** record repayments.
 | FR-1.4 | A user can sign in and sign out, and the session survives an app restart. |
 | FR-1.5 | The app stores only an email address and an optional display name. No phone number, no address, no payment details. |
 | FR-1.6 | A user can permanently delete their own account from within the app, without contacting support. |
-| FR-1.7 | Deleting an account removes all of that user's personal data. It removes them from periods they belong to but **never** deletes those periods or anyone else's data in them. |
+| FR-1.7 | Deleting an account removes all of that user's personal data. It removes them from periods they belong to but **never** deletes those periods or anyone else's expenses, splits, or budgets in them. Shared rows that named the deleted user keep a non-identifying tombstone (no email, no display name). |
+| FR-1.8 | A user who is the manager of a period cannot delete their account until they transfer the role or delete that period. This is how FR-4.7 (a period always has a manager) survives FR-1.7. |
 
 > **Operational note:** email delivery must use a real transactional email
 > provider from the first release. A rate-limited free tier will break signup
@@ -138,10 +141,10 @@ transactions, and does **not** record repayments.
 | ID | Requirement |
 | --- | --- |
 | FR-3.1 | A user can record an expense with an amount, a date, a category and an optional note. |
-| FR-3.2 | The date defaults to today and can be any past date. Future dates are rejected. |
+| FR-3.2 | The date defaults to today in the user's IANA time zone and can be any past date. Future dates are rejected. The same "not in the future" rule applies to shared expenses. |
 | FR-3.3 | Amounts must be greater than zero. The app does not accept negative amounts in v1. |
-| FR-3.4 | A user can edit or delete any of their own personal expenses, at any time. |
-| FR-3.5 | Deleted expenses are hidden everywhere but remain recoverable by the user for a period of time. |
+| FR-3.4 | A user can edit or delete any of their own personal expenses, at any time. Personal edits may change amount, date, category, and note. Changing the amount updates the single owner split in the same save so the total still matches. |
+| FR-3.5 | Deleted expenses are hidden everywhere but remain recoverable by the user for a period of time. Soft-deleted means hidden, not erased. Only account deletion (FR-1.7) truly erases personal data. |
 | FR-3.6 | A user can browse their expenses by month and by category, and search their notes by text. |
 
 ### 4.4 Periods
@@ -154,8 +157,8 @@ transactions, and does **not** record repayments.
 | FR-4.4 | The member list is fixed when the period is created. In v1, members cannot be added, removed, or invited later. |
 | FR-4.5 | A period's expenses must have a date within the period's range. An expense dated outside the range is rejected with a clear message — never silently moved. |
 | FR-4.6 | Every period has exactly one manager, and that manager can transfer the role to another member. |
-| FR-4.7 | The last manager cannot leave or be removed. A period always has a manager. |
-| FR-4.8 | The manager can delete a period. Deleting a period removes its expenses and budgets. |
+| FR-4.7 | A period always has a manager. The last manager cannot leave or be removed, including by deleting their account (FR-1.8). |
+| FR-4.8 | The manager can delete a period. Deleting a period hides it and its expenses and budgets from every member (soft-delete). It does not hard-erase rows. Those rows stay out of every total. |
 | FR-4.9 | Members of a period can see every expense in it, including who paid and who it was split between. |
 | FR-4.10 | A user who is not a member of a period has no access to it — not its name, not its existence, not its totals. |
 | FR-4.11 | A period has a single currency, chosen when it is created. |
@@ -173,6 +176,7 @@ transactions, and does **not** record repayments.
 | FR-5.7 | No share may be negative. |
 | FR-5.8 | **Who shares in an expense is fixed when it is created.** If the roster later changed, past expenses would not change with it. (v1 has a fixed roster; this rule exists so that adding join/leave later is safe.) |
 | FR-5.9 | The author chooses the split; no other member is asked to confirm it. |
+| FR-5.10 | After a shared expense is saved, its amount and splits cannot be edited. To change the split, the author or manager soft-deletes it and records a new expense. Date (still inside the period, not in the future) and note may be edited. |
 
 ### 4.6 Balances
 
@@ -190,7 +194,7 @@ transactions, and does **not** record repayments.
 | --- | --- |
 | FR-7.1 | A budget is an amount, for a calendar month, targeting either the user or a period. |
 | FR-7.2 | A budget targets one scope only: either a personal scope or a specific period. The two are never mixed. |
-| FR-7.3 | A budget applies either to a single category or to the whole scope. |
+| FR-7.3 | A **personal** budget applies either to a single category or to the whole personal scope. A **period** budget in v1 is whole-scope only — shared expenses have no category (FR-8.4). |
 | FR-7.4 | **A personal budget counts only personal expenses.** It never counts a user's share of a shared cost. |
 | FR-7.5 | **A period budget counts that period's gross spend**, regardless of who paid. |
 | FR-7.6 | Budgets run from the first to the last day of a calendar month. |
@@ -204,7 +208,7 @@ transactions, and does **not** record repayments.
 | FR-8.1 | The personal view shows this month's total spend, broken down by category. |
 | FR-8.2 | The personal view shows spend per day for the month. |
 | FR-8.3 | The personal total counts **only personal expenses**. A user's share of shared costs is shown separately and is never folded into the personal total. |
-| FR-8.4 | The period view shows gross total spend and the breakdown by category. |
+| FR-8.4 | The period view shows gross total spend. In v1 there is no category breakdown for a period: shared expenses are uncategorised so that no member has to read another member's private categories (FR-2.5). |
 | FR-8.5 | Reports respect budget progress bars for the relevant scope. |
 | FR-8.6 | Every reported figure excludes deleted expenses. |
 | FR-8.7 | In v1, reports are monthly. Choosing a custom date range or comparing months is deferred. |
@@ -264,8 +268,10 @@ figure but remain recoverable. Only account deletion truly erases data.
 identifier, and not even for a period they were once in.
 
 **BR-9 — The manager exists to fix mistakes, not to gatekeep.** Members can
-correct and remove their own expenses immediately. The manager's extra power is
-for other people's errors, and for keeping the period healthy.
+soft-delete their own expenses immediately, and can edit date and note on a
+shared expense they authored. Amount and splits on a shared expense are not
+edited in place (FR-5.10). The manager's extra power is for other people's
+errors, and for keeping the period healthy.
 
 **BR-10 — The server is the judge.** Split totals, period membership, date
 ranges, and permissions are all verified before anything is saved. Correctness
@@ -310,7 +316,9 @@ to be added later **without changing the meaning of existing data.**
   run?" question answered, which is a new subsystem, not a new field.)*
 - Splitting by percentage, by weights such as "adults pay double", or by ratio.
   *(Possible later as a new way to enter amounts; stored shares do not change.)*
-- Changing a split after other members have seen the expense.
+- Changing a shared expense's amount or splits after it is saved. *(Delete
+  and recreate instead; FR-5.10.)*
+- Categories on shared expenses, and period budgets scoped to a category.
 
 **Periods**
 - Inviting people, joining a period, or leaving one. *(The roster is fixed at
@@ -363,8 +371,9 @@ v1 is complete when all of the following are true.
    periods — verified by automated tests, not by inspection.**
 8. **All financial calculations are covered by tests with known-good expected
    values**, including the awkward cases: an amount that does not divide evenly,
-   a one-cent expense, a member who joined partway through, and a deleted expense.
-9. Both Android and iOS builds are installable and pass the full journey.
+   a one-cent expense, an expense that excludes a member, and a deleted expense.
+9. An Android build is installable and passes the full journey. iOS uses the
+   same codebase (NFR-1) and follows Android (NFR-2); it is not a v1 gate.
 
 ---
 
@@ -394,6 +403,13 @@ part is built.
 8. **The final starter category list.** Should include something for money
    coming in, so users are not forced to record fake spending.
 
+Resolved in the 2026-10-14 alignment pass (see also `ARCHITECTURE.md` §9):
+shared expenses are uncategorised; period budgets are whole-scope; shared
+amount/splits are immutable after create; account deletion tombstones the
+profile and refuses deletion while the user is still a period manager;
+unverified accounts cannot be used; v1 tests do not include mid-period joins;
+Android is the v1 installable gate.
+
 ---
 
 ## 10. Glossary
@@ -401,7 +417,7 @@ part is built.
 | Term | Meaning |
 | --- | --- |
 | **Period** | A named, time-bounded group of people who share costs together. A trip, a term in a shared flat. Has a start date and an optional end date. |
-| **Manager** | The single member of a period responsible for it. Can edit and delete anyone's expense in that period, manage the roster, and transfer the role. |
+| **Manager** | The single member of a period responsible for it. Can edit and delete anyone's expense in that period, and transfer the role. |
 | **Member** | A person in a period who can record costs into it. |
 | **Share** | The exact amount one person owes from one shared expense. |
 | **Paid** | The total a person fronted with their own money. |

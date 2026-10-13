@@ -1,7 +1,11 @@
 # PersonalExpendiure — Architecture (v1)
 
 Status: draft, v1 scope agreed through design interview.
-Last updated: 2026-10-12
+Last updated: 2026-10-14
+
+Companion to [`REQUIREMENTS.md`](./REQUIREMENTS.md). When they disagree, that
+document wins on intent and this one wins on mechanism. The 2026-10-14 pass
+aligns the two.
 
 ---
 
@@ -31,8 +35,10 @@ one of these, the change needs an explicit decision.
   (cents) paired with an ISO-4217 currency code.
 - **Splits are stored as computed results, not as rules.** A share amount is
   frozen at creation time, so history never changes meaning.
-- **Soft deletes everywhere.** Nothing is hard-deleted except by explicit
-  account deletion.
+- **Deleted means hidden, not erased.** Expenses, periods, and budgets are
+  soft-deleted (`deleted_at`). Categories are archived. The only hard erase is
+  account deletion of *personal* data; shared ledger rows survive as a
+  tombstone (FR-1.7).
 - **Validate on the server, always.** The client is not trusted, including the
   client's own app.
 
@@ -43,39 +49,60 @@ one of these, the change needs an explicit decision.
 ### 2.1 Accounts and access
 
 - Email + password signup, email verification, password reset, logout.
+- **Unverified accounts cannot be used (FR-1.2).** Supabase requires a confirmed
+  email before issuing a usable session. RLS and every write RPC also refuse
+  `auth.uid()` unless `profiles.auth_user_id` is set and `deleted_at` is null.
 - Sessions: Supabase JWT + refresh tokens in device secure storage.
 - Onboarding: a single screen asking for base currency, then confirming starter
-  categories. No demo data, no auto-created periods.
+  categories. IANA time zone is taken from the device and can be changed in
+  settings. No demo data, no auto-created periods.
 - Minimal PII: `id`, `email`, optional `display_name`. Nothing else.
-- Self-service account deletion with full cascade delete of the user's own data.
+- Self-service account deletion (FR-1.7, FR-1.8):
+  - Purge personal expenses, personal budgets, and categories.
+  - Strip PII from the profile and keep the row as a tombstone so other
+    people's shared expenses and splits still resolve `paid_by` / split
+    `user_id`.
+  - Remove `period_members` rows for this user.
+  - **Reject** deletion if the user is still manager of any period — they
+    transfer the role or delete the period first.
 
 ### 2.2 Personal expenses
 
 - Create / edit / soft-delete an expense: amount, date, category, optional note.
+  Amount edits rewrite the single owner split in the same RPC.
 - Flat categories per user (seeded, editable, reorderable, archivable).
 - Browse and filter: by month, by category, text search on note.
-- Monthly budgets, scoped to the user or to a period.
+- Monthly budgets: personal (whole-scope or per category) or period
+  (whole-scope only in v1). Each budget row is for one calendar month.
 - Reports: month total, breakdown by category, spend per day, budget progress.
 
 ### 2.3 Periods (shared)
 
 - A Period has a name, a manager, a start date, and an optional end date
   (`NULL` = ongoing).
-- **Fixed roster.** Members are added when the Period is created. There is no
-  invite, join, or accept flow in v1.
+- **Fixed roster.** Members are added when the Period is created, by exact
+  email match inside `create_period()` — never by listing `profiles`. There is
+  no invite, join, or accept flow in v1.
 - Any member can create an expense in the Period.
 - Author chooses how each expense is divided: equal among everyone by default,
-  or exclude specific members, or type exact amounts per person.
+  or exclude specific members (omit a split row), or type exact amounts per
+  person.
+- Shared expenses have `category_id IS NULL`. Period reports have no category
+  breakdown in v1.
 - Balances screen: for each member, total paid, total owed, net.
 - Permission model:
 
 | Action | Member, own expense | Member, another's expense | Manager |
 | --- | --- | --- | --- |
 | Create | yes | yes (into their period) | yes |
-| Edit | yes | no | yes |
+| Edit date / note | yes | no | yes |
+| Edit amount / splits | no (delete and recreate) | no | no (delete and recreate) |
 | Delete (soft) | yes | no | yes |
 
-- Manager can transfer the role. The last manager cannot leave or be removed.
+- Manager can transfer the role. The last manager cannot leave, be removed, or
+  delete their account until they transfer or delete the period.
+- Manager can soft-delete the period. That sets `deleted_at` on the period and
+  on its expenses and budgets. Members stop seeing it; rows are not hard-erased.
 
 ### 2.4 Import / export
 
@@ -85,8 +112,9 @@ one of these, the change needs an explicit decision.
 
 ### 2.5 Offline behaviour
 
-- Reads are served from the TanStack Query cache with a clear
-  "offline — showing data from *time*" banner.
+- Reads are served from the TanStack Query cache, **persisted on device**
+  (e.g. MMKV) so a cold start can render last-known data (FR-10.1, NFR-3).
+- Offline banner: "showing data from *time*".
 - Writes require a connection and fail loudly. No write queue, no local
   database in v1.
 
@@ -113,7 +141,9 @@ Kept as an explicit, maintained list. Many of these are additive later by design
 - Recurring / scheduled expenses.
 - Split types beyond equal and exact: percentage, "N shares", proportional.
   *(Additive: split amounts are already stored as computed values.)*
-- Split edits after creation by non-authors.
+- Split edits after creation. Amount and splits on a shared expense are
+  immutable; delete and recreate instead (FR-5.10).
+- Categories on shared expenses, and period budgets scoped to a category.
 
 **Periods**
 - Invite / join / accept flows; members joining or leaving on their own.
@@ -153,7 +183,7 @@ Kept as an explicit, maintained list. Many of these are additive later by design
 | Backend | **Supabase (managed Postgres + Auth)** | Over a custom Node backend: auth is 2–4 weeks of security-sensitive work you don't need to own. RLS enforces tenant isolation in the database, so a missing `WHERE user_id = ?` in app code cannot leak data. |
 | SQL logic | **Postgres functions + views** | Balance and report math lives here so there is exactly one implementation across phone, edge functions, and future clients. |
 | Email | **Resend or Postmark** | **Not** Supabase's built-in SMTP: it is rate-limited to roughly 2 emails/hour on the free tier, which breaks signup and password reset in ways users experience as "the app is broken". |
-| Auth method | **Email + password** | Over OAuth: no custom URL scheme or associated-domain setup to debug in Expo. Apple's Sign-in-with-Apple requirement (App Store rule 4.8) is a further cost for no v1 benefit. |
+| Auth method | **Email + password** | Over OAuth: no custom URL scheme or associated-domain setup to debug in Expo. App Store rule 4.8 (Sign in with Apple) applies only if a third-party login is offered. Email + password alone does not require it. |
 | Testing | **Jest (jest-expo) + Supabase local stack + pgTAP** | Jest for TypeScript, including pure money/split logic. Local Supabase for real RLS enforcement. |
 | CI/CD | **GitHub Actions + EAS Build + EAS Update** | EAS manages signing and store submission. Hosted builds are reversible — `expo prebuild` remains available. |
 | Lint/format | **Biome, or ESLint + Prettier** | Either is fine; pick one and don't churn. |
@@ -174,15 +204,18 @@ zone). All amounts are `bigint` minor units.
 ### 5.1 Tables
 
 #### `profiles`
-One row per user, created by a trigger on `auth.users`.
+One row per user, created by a trigger on `auth.users`. The profile id is the
+stable public identity. Auth can go away without deleting shared history.
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| `id` | `uuid` PK | → `auth.users(id)` `ON DELETE CASCADE` |
-| `email` | `text` | |
-| `display_name` | `text` | nullable |
+| `id` | `uuid` PK | Public identity. FKs from expenses and splits point here. |
+| `auth_user_id` | `uuid` | → `auth.users(id)` `ON DELETE SET NULL`. Unique while set. Null on a tombstone. |
+| `email` | `text` | Null on a tombstone. |
+| `display_name` | `text` | nullable; null on a tombstone |
 | `base_currency` | `char(3)` | ISO-4217. Every personal amount uses this. |
-| `timezone` | `text` | IANA, e.g. `Europe/Berlin`. Needed for future "today" cutoffs and recurring due dates. |
+| `timezone` | `text` | IANA, e.g. `Europe/Berlin`. Used in v1 for "today" and month bounds. |
+| `deleted_at` | `timestamptz` | nullable — set when the account is deleted (tombstone) |
 | `created_at` / `updated_at` | `timestamptz` | |
 
 #### `categories`
@@ -202,29 +235,36 @@ Indexes: unique `(user_id, lower(name))`; `(user_id, sort_order)`.
 | --- | --- | --- |
 | `id` | `uuid` PK | |
 | `name` | `text` | |
-| `manager_id` | `uuid` | → `profiles(id)` |
+| `manager_id` | `uuid` | → `profiles(id)` — denormalised cache of the manager. `period_members.role` is authoritative. `transfer_manager()` updates both in one transaction. |
 | `starts_on` | `date` | |
 | `ends_on` | `date` | nullable — `NULL` means ongoing |
 | `currency` | `char(3)` | single currency for the whole period |
+| `deleted_at` | `timestamptz` | nullable — manager-deleted period (FR-4.8) |
 | `created_at` / `updated_at` | `timestamptz` | |
 
 Check: `ends_on IS NULL OR ends_on >= starts_on`.
+
+The partial unique index on `period_members` gives **at most** one manager.
+`create_period()` requires **at least** one. Together: exactly one live manager
+on a live period.
 
 #### `period_members`
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | `uuid` PK | |
-| `period_id` | `uuid` | → `periods(id)` `ON DELETE CASCADE` |
-| `user_id` | `uuid` | → `profiles(id)` `ON DELETE CASCADE` |
-| `role` | `enum('manager','member')` | |
+| `period_id` | `uuid` | → `periods(id)` — no cascade from profile deletion |
+| `user_id` | `uuid` | → `profiles(id)` `ON DELETE RESTRICT` |
+| `role` | `enum('manager','member')` | authoritative manager flag |
 | `joined_at` | `timestamptz` | |
 
 Constraints:
 - `UNIQUE (period_id, user_id)`
-- Partial unique index on `(period_id)` **where `role = 'manager'`** — guarantees
-  exactly one manager per period.
-- The last manager cannot leave or be removed (enforced in the transfer/removal
-  functions).
+- Partial unique index on `(period_id)` **where `role = 'manager'`** — at most
+  one manager per period.
+- Index `(user_id)` for "my periods".
+- Roster changes (add/remove) are not in v1. Account deletion removes the
+  membership row via `delete_account()`, after FR-1.8 is satisfied. The last
+  manager cannot be removed.
 
 #### `expenses`
 The central table. A row is either **personal** (`period_id IS NULL`) or
@@ -233,10 +273,10 @@ The central table. A row is either **personal** (`period_id IS NULL`) or
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | `uuid` PK | **client-generated** — enables idempotent create and an offline queue later |
-| `user_id` | `uuid` | author / creator. Also the owner for personal expenses. |
+| `user_id` | `uuid` | author / creator. Also the owner for personal expenses. → `profiles(id)` `ON DELETE RESTRICT` (tombstone keeps the row). |
 | `period_id` | `uuid` | nullable |
-| `category_id` | `uuid` | nullable — shared expenses may be uncategorised |
-| `paid_by` | `uuid` | for personal rows this must equal `user_id` |
+| `category_id` | `uuid` | nullable. **v1: must be NULL when `period_id` is set.** Personal expenses should set a category. |
+| `paid_by` | `uuid` | for personal rows this must equal `user_id`. → `profiles(id)` `ON DELETE RESTRICT`. |
 | `amount_minor` | `bigint` | `CHECK (amount_minor > 0)` |
 | `currency` | `char(3)` | v1: equals the user's base currency, or the period's currency |
 | `occurred_on` | `date` | accounting date, no time zone |
@@ -247,8 +287,11 @@ The central table. A row is either **personal** (`period_id IS NULL`) or
 Check:
 ```sql
 CHECK ((period_id IS NULL AND paid_by = user_id)
-    OR (period_id IS NOT NULL AND paid_by IS NOT NULL))
+    OR (period_id IS NOT NULL AND paid_by IS NOT NULL AND category_id IS NULL))
 ```
+
+Currency: a trigger (not a comment) requires `currency` to equal the owner's
+`base_currency` when `period_id` is null, or the period's `currency` otherwise.
 
 Indexes: `(period_id, occurred_on DESC)` where `deleted_at IS NULL`;
 `(user_id, occurred_on DESC)` where `period_id IS NULL AND deleted_at IS NULL`.
@@ -260,58 +303,102 @@ One row per participant. **The split result, not the split rule.**
 | --- | --- | --- |
 | `id` | `uuid` PK | |
 | `expense_id` | `uuid` | → `expenses(id)` `ON DELETE CASCADE` |
-| `user_id` | `uuid` | participant |
-| `amount_minor` | `bigint` | `CHECK (amount_minor >= 0)` |
+| `user_id` | `uuid` | participant → `profiles(id)` `ON DELETE RESTRICT` |
+| `amount_minor` | `bigint` | `CHECK (amount_minor > 0)` — excluded members get **no row**, not a zero share |
 | `created_at` | `timestamptz` | |
 
 Constraints:
 - `UNIQUE (expense_id, user_id)`
+- Index `(user_id)` for `owes_minor`.
 - **Invariant: `SUM(amount_minor) == expenses.amount_minor`** for every expense.
-  Enforced in `create_expense()`; asserted in tests.
+  Enforced in `create_expense()` / `update_expense()`; asserted in tests.
 
 A personal expense has exactly **one** split row: its owner, for the full
 amount. This unifies the balance query — there is no separate code path for
 "personal" versus "shared".
 
 #### `budgets`
+One row per scope per calendar month (and per category, when set). Not a
+repeating template — creating next month's budget is a new row.
+
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | `uuid` PK | |
 | `scope_type` | `enum('user','period')` | |
 | `user_id` | `uuid` | nullable; set iff `scope_type = 'user'` |
 | `period_id` | `uuid` | nullable; set iff `scope_type = 'period'` |
-| `category_id` | `uuid` | nullable — `NULL` means a whole-scope budget |
+| `category_id` | `uuid` | nullable — `NULL` means whole-scope. Must be NULL when `scope_type = 'period'` (v1). |
+| `month_start` | `date` | first day of the calendar month this budget applies to. `CHECK (EXTRACT(DAY FROM month_start) = 1)` |
 | `amount_minor` | `bigint` | `CHECK (amount_minor > 0)` |
+| `deleted_at` | `timestamptz` | nullable |
 | `created_at` / `updated_at` | `timestamptz` | |
 
 Check enforcing exactly one scope:
 ```sql
 CHECK ((scope_type = 'user'   AND user_id IS NOT NULL AND period_id IS NULL)
-    OR (scope_type = 'period' AND period_id IS NOT NULL AND user_id IS NULL))
+    OR (scope_type = 'period' AND period_id IS NOT NULL AND user_id IS NULL
+        AND category_id IS NULL))
 ```
 
-Cycle: **calendar month**, 1st to last. Budgets are **soft warnings** — the app
-never blocks recording an expense.
+Unique: `(scope_type, user_id, period_id, category_id, month_start)` where
+`deleted_at IS NULL`.
+
+Cycle: **calendar month**, 1st to last, in the relevant zone (user timezone for
+personal; still passed as `(from, to)` dates). Budgets are **soft warnings** —
+the app never blocks recording an expense.
 
 ### 5.2 Derived logic (Postgres)
 
+Write RPCs (`create_expense`, `update_expense`, `soft_delete_expense`,
+`create_period`, `transfer_manager`, `soft_delete_period`, `delete_account`)
+are `SECURITY DEFINER` with `SET search_path = pg_catalog, public`. Direct
+`INSERT`/`UPDATE`/`DELETE` on `expense_splits` is revoked from `authenticated`.
+This is the only way "splits via RPC only" is actually true. Helpers used from
+RLS (`is_period_member(uid, pid)`) are also `SECURITY DEFINER` with a locked
+`search_path`, so `periods` and `period_members` policies do not recurse.
+
 #### `create_expense(...) → uuid`
-A single `SECURITY DEFINER`-free RPC that performs the whole operation in one
-transaction. This is the app's main write path and the main trust boundary.
+The app's main write path and the main trust boundary. One transaction.
 
-1. Authorise: the caller must be the `user_id`, and if `period_id` is set, the
-   caller must be a member of that period.
-2. Validate the date: if the expense is shared, `occurred_on` must fall within
-   `[starts_on, ends_on]` of the period. **Reject, never clamp.**
-3. Validate participants: every split `user_id` must be a member of the period
-   (or the owner, for a personal expense).
-4. Validate amounts: all non-negative, and `SUM(splits) == amount_minor`
-   exactly. No tolerance.
-5. Insert the expense, insert the splits.
-6. Return the new id.
+1. Authorise: the caller must be the `user_id`, with a live (non-tombstone)
+   profile, and if `period_id` is set, the caller must be a member of that
+   live period.
+2. Validate the date:
+   - `occurred_on` must not be after **today** in the author's `profiles.timezone`.
+     **Reject, never clamp.**
+   - If shared, `occurred_on` must also fall within `[starts_on, ends_on]` of
+     the period, inclusive. **Reject, never clamp.**
+3. Validate participants: every split `user_id` must be a current member of
+   the period (or the owner, for a personal expense). Excluded members are
+   omitted, not stored as zero.
+4. Validate amounts: each split `amount_minor > 0`, and `SUM(splits) ==
+   amount_minor` exactly. No tolerance.
+5. Shared expenses: force `category_id` null. Personal: `currency` must equal
+   `base_currency`; shared: equal the period currency.
+6. Insert the expense, insert the splits.
+7. Return the new id.
 
-Because the id is client-generated, a repeat call with the same id is a no-op
-rather than a duplicate.
+Idempotency: because the id is client-generated,
+- same id **and** same payload → success (return the id);
+- same id **and** a different payload → conflict (do not overwrite);
+- new id → insert.
+
+#### `update_expense(...)`
+Author of the row, or the period manager.
+
+- **Personal:** amount, `occurred_on`, `category_id`, `note`. An amount change
+  rewrites the single owner split in the same transaction so the sum invariant
+  holds.
+- **Shared:** `occurred_on` and `note` only. Amount and splits are rejected
+  (FR-5.10). Date rules are the same as create.
+
+#### `soft_delete_expense(...)`
+Sets `deleted_at`. Author of own, or period manager. Does not touch splits.
+
+#### `expense_totals(scope, from, to)`
+Report aggregates. Scope is `('user', user_id)` or `('period', period_id)`.
+Month boundaries are computed **in the user's zone**, never in UTC, and are
+passed as explicit `(from, to)` date ranges — never as a `'2026-03'` string.
 
 #### `period_balances(period_id) → table`
 Returns one row per member:
@@ -325,12 +412,6 @@ net_minor   = paid_minor - owes_minor      -- positive: m is owed money
 Balances are **always computed**, never stored or incrementally maintained. A
 maintained balance table drifts; a computed one cannot.
 
-#### `expense_totals(scope, from, to)`
-Report aggregates. Scope is `('user', user_id)` or `('period', period_id)`.
-Month boundaries are computed **in the user's zone**, never in UTC, and are
-passed as explicit `(from, to)` date ranges — never as a `'2026-03'` string.
-Never a `'2026-03'` string.
-
 ### 5.3 Reporting semantics
 
 These rules prevent the classic "why does October say I spent $12,000" bug.
@@ -340,6 +421,7 @@ These rules prevent the classic "why does October say I spent $12,000" bug.
 | **Personal total** | Only expenses with `period_id IS NULL` owned by me. Counted at **100%**. |
 | **My share of shared costs** | Shown separately as a "shared" line, never folded into the personal total. |
 | **Period total** | All non-deleted expenses in the period, at **gross** amount, regardless of payer. |
+| **Period by category** | Not in v1. Shared expenses have no category. |
 | **Period balances** | Gross up for the group, net per member (see §5.2). |
 
 A **personal budget** counts only personal expenses. A **period budget** counts
@@ -363,25 +445,32 @@ Enabled on every table. The client never uses the service-role key.
 
 | Table | select | insert | update | delete |
 | --- | --- | --- | --- | --- |
-| `profiles` | own row | — | own row | — |
-| `categories` | own | own | own | own |
-| `periods` | member of the period | caller becomes manager | manager | manager |
-| `period_members` | member of the period | manager | manager | manager (not the last one) |
-| `expenses` | own, **or** member of its period | author, plus period membership and date-range checks | author of own, or manager of its period | author of own, or manager (soft) |
-| `expense_splits` | same as parent expense | via `create_expense()` only | with parent | with parent |
-| `budgets` | own scope | own scope | own scope | own scope |
+| `profiles` | own live row | — (trigger on `auth.users`) | own live row | — (via `delete_account()`) |
+| `categories` | own | own | own | own (archive preferred; hard delete rejected if referenced) |
+| `periods` | member of a live period | via `create_period()` | manager | via `soft_delete_period()` |
+| `period_members` | member of that live period | via `create_period()` | via `transfer_manager()` | via `delete_account()` |
+| `expenses` | own personal, **or** member of its live period | via `create_expense()` | via `update_expense()` | via `soft_delete_expense()` |
+| `expense_splits` | same as parent expense | via `create_expense()` only | via `update_expense()` only | with parent |
+| `budgets` | own personal, or member of the period for a period budget | own personal, or period manager for a period budget | same as insert | same (soft) |
 
-The expense policy in full:
+Live period means `periods.deleted_at IS NULL`. Membership checks go through
+`is_period_member(auth.uid(), period_id)`, not a raw subquery, to avoid RLS
+recursion.
+
+The expense SELECT policy in full:
 ```sql
 USING (
-  user_id = auth.uid()
-  OR period_id IN (SELECT period_id FROM period_members WHERE user_id = auth.uid())
+  (user_id = (SELECT id FROM profiles WHERE auth_user_id = auth.uid() AND deleted_at IS NULL)
+   AND period_id IS NULL)
+  OR is_period_member(auth.uid(), period_id)
 )
 ```
 
-Triggers or RPCs must enforce membership and the date-range check on insert; RLS
-alone cannot reference another table's rows inside `WITH CHECK` safely for this
-case. `create_expense()` is the enforcement point.
+A former member whose `period_members` row was removed sees **zero** rows from
+that period (BR-8). Tombstone profiles are not selectable by their former owner.
+
+Write checks (membership, date range, currency, split sum) live in the RPCs,
+not only in `WITH CHECK`.
 
 ---
 
@@ -436,6 +525,7 @@ PersonalExpendiure/
 ├─ e2e/                          # Maestro flows — optional, added after v1
 ├─ .github/workflows/            # ci.yml, migration-check.yml
 ├─ docs/ARCHITECTURE.md
+├─ docs/REQUIREMENTS.md
 └─ package.json
 ```
 
@@ -458,16 +548,16 @@ Rules:
 | 4 | Client-generated UUIDs on expense create | Server-generated ids | Enables idempotent create now and an offline write queue later without a data migration. |
 | 5 | One currency per user and per period | Multi-currency with FX | All totals are trivially correct. The currency column already exists, so this is additive later. |
 | 6 | Integer minor units | `float` / `numeric` in JS | No cent-level drift, ever. Cost: every amount crosses the JS boundary as a number that must be formatted explicitly. |
-| 7 | Freeze computed split amounts | Store the split rule (equal/percent/…) | Historical balances never change meaning, and new split types become a UI-only change. Cost: you cannot re-derive a split after editing — acceptable, since split edits are not in v1 scope. |
+| 7 | Freeze computed split amounts; shared amount/splits immutable after create | Store the split rule, or allow in-place split edits | Historical balances never change meaning. Cost: changing a shared split means delete + recreate (FR-5.10). |
 | 8 | Equal + exact custom splits | Full Splitwise rule set | Validation is bounded (non-negative, must total exactly). Percentage and "N shares" are pure UI additions later. |
 | 9 | Balance and report math in SQL | Compute in TypeScript on the client | One implementation for the phone, edge functions, and any future client. They cannot disagree. |
-| 10 | Server-side `create_expense()` RPC | Client inserts plus RLS checks | All validation happens atomically in one transaction, in the trust boundary, with no partially-written expenses. |
-| 11 | Soft delete everywhere | Hard delete | Preserves an audit trail and gives cached clients a tombstone, so deleted rows don't resurrect. Cost: every query must filter `deleted_at IS NULL`. |
+| 10 | Server-side write RPCs (`SECURITY DEFINER`, locked `search_path`) | Client inserts plus RLS; DEFINER-free RPCs | Validation is atomic. Direct `INSERT` on splits is revoked. Cost: DEFINER functions must be reviewed; `search_path` must stay locked. |
+| 11 | Soft-delete expenses, periods, and budgets; archive categories; tombstone on account delete | Hard delete everywhere, or soft-delete every table | Cached clients see a tombstone instead of a resurrection. Personal data is actually erased on account deletion; shared history is not (FR-1.7). |
 | 12 | Last-write-wins, no conflict engine | Optimistic locking / CRDTs | Simplicity. Accepted risk: two simultaneous edits to the same expense silently lose one. Manager-gated deletion keeps the blast radius small. |
 | 13 | Cached reads, online-only writes | Full offline-first sync | Avoids a sync protocol entirely. Accepted cost: you cannot record an expense with no signal. |
 | 14 | Fixed period roster, no invites | Invite/accept lifecycle | Avoids invite tokens, pending states, "member left" handling, and the "we edited an expense someone already saw" class of bugs. Cost: the manager must know everyone's account up front. |
 | 15 | Manager role with transfer | Manager as permanent creator | No single point of failure: a lost account can't freeze a period forever. |
-| 16 | Split membership snapshotted at creation | Dynamic membership at query time | Someone joining or leaving never retroactively changes what people owe. |
+| 16 | Split membership snapshotted at creation | Dynamic membership at query time | Someone joining or leaving later never retroactively changes what people owe. v1 has a fixed roster; the snapshot is what makes join/leave safe to add. |
 | 17 | Flat categories | Nested tree | Simple schema and one-level reporting. Escape hatch is `category_groups`, which groups existing categories without migrating history. |
 | 18 | Budgets are soft warnings | Hard blocks | Nobody abandons an app because a dinner wouldn't fit under a budget. |
 | 19 | One source of truth for server data | Mirroring into a local store | TanStack Query owns all server state; local stores hold only UI state. Prevents the classic duplicated-cache divergence bug. |
@@ -485,14 +575,16 @@ are database concerns.
 
 Pure functions, no mocks, no database. Target: full coverage.
 
-- `allocate()` — including `1000 / 3`, `1 / 3`, `0`, `n = 1`, and a large amount
-  near `bigint` range. Assert **determinism**: the same input always yields the
-  same per-person distribution in the same order.
+- `allocate()` — including `1000 / 3`, `1 / 3`, `n = 1`. Assert **determinism**:
+  the same input always yields the same per-person distribution in the same
+  order. Do not drive this through JS `Number` near Postgres `bigint` range;
+  JSON numbers are only safe up to 2^53 − 1. PostgREST should return amounts
+  that fit that, or as strings.
 - `parseAmount()` / `formatAmount()` — round-tripping, locale separators, and
   exactly two decimal places.
 - Month range computation in a time zone, across a DST boundary.
 - Date validation against a period's `[starts_on, ends_on]`, inclusive at both
-  ends.
+  ends, and against "today" in an IANA zone.
 
 ### 8.2 Integration tests (local Supabase + pgTAP)
 
@@ -515,11 +607,11 @@ must include the awkward cases:
 
 - $10.00 split three ways → `334 / 333 / 333`.
 - A $0.01 expense in a period.
-- A member who was added mid-period (owes nothing for earlier expenses).
+- An expense that excludes some members (those people owe nothing on it).
 - An expense with exact custom shares that total to the expense amount.
 - A period with a manager who paid for everything.
 - A soft-deleted expense (must contribute nothing).
-- A period expense with no category.
+- A period expense with no category (the v1 shared case).
 
 Assert the exact integer values, not just that the query returned rows. Money
 bugs produce wrong numbers, not exceptions.
@@ -565,9 +657,14 @@ has only ever run on one laptop will break production.
    expenses are purged after N days.
 7. **Analytics and crash reporting.** Currently none. If Sentry or PostHog is
    added, decide what the consent story is for a multi-tenant app.
-8. **Signup abuse.** Rate limiting, email verification enforcement, and bot
-   prevention for a public app.
+8. **Signup abuse.** Rate limiting and bot prevention for a public app. Email
+   verification itself is required (FR-1.2); this item is about abuse at scale.
 9. **Starter category list.** Final set not agreed. Should include an
    income-ish or refund-ish category so users aren't forced to fake an expense.
-10. **Category deletion vs. archival.** v1 archives. Whether a user may ever
-    hard-delete a category still referenced by historical expenses is undecided.
+
+Resolved in the 2026-10-14 alignment pass (do not reopen without changing both
+docs): shared expenses are uncategorised; period budgets are whole-scope;
+shared amount/splits are immutable after create; account deletion tombstones
+the profile; unverified sessions cannot write; v1 golden tests do not include
+mid-period joins; Android is the v1 installable gate; category archival (not
+hard-delete of referenced categories) is the v1 rule.
