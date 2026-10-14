@@ -1,0 +1,80 @@
+openapi: 3.1.0
+info:
+  title: PersonalExpenditure API
+  version: 0.1.0
+  description: >-
+    Go application API. Supabase Auth owns user credentials and sessions;
+    authenticated requests use Supabase access tokens and Postgres RLS.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      summary: Check whether the API process is running
+      responses:
+        '200':
+          description: API process is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+  /v1/me:
+    get:
+      operationId: getCurrentUser
+      summary: Return the authenticated user's verified ID
+      security:
+        - supabaseBearer: []
+      responses:
+        '200':
+          description: Verified current user
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id]
+                properties:
+                  user_id:
+                    type: string
+                    format: uuid
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/IdentityProviderUnavailable'
+components:
+  securitySchemes:
+    supabaseBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+  responses:
+    Unauthorized:
+      description: Missing, invalid, or expired Supabase access token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    IdentityProviderUnavailable:
+      description: Supabase Auth could not validate the token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

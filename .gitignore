@@ -60,7 +60,8 @@ supabase/.env.*.local
 supabase/volumes/
 supabase/logs/
 # Note: supabase/config.toml, migrations/, seed.sql, tests/ and functions/
-# ARE committed. src/db/types.ts is generated and is also committed.
+# ARE committed. src/api/types.ts is generated from backend/openapi.yaml and
+# is committed.
 
 # Expo
 .expo/

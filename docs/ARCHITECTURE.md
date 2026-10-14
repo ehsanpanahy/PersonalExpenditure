@@ -115,11 +115,13 @@ one of these, the change needs an explicit decision.
 - All authenticated application data requests go through the Go API. The mobile
   app signs in and refreshes sessions with Supabase Auth, then sends the current
   Supabase access token to the API as a bearer token.
-- The API validates the token using a maintained Go JWT library: verify
-  signature, issuer, audience, expiry, and subject. Use the project's JWKS for
-  asymmetric signing keys; for legacy shared-secret signing, validate with the
-  Supabase Auth user endpoint. Derive caller identity only from verified claims,
-  never from a user ID supplied in a request body or URL.
+- The current Go API scaffold validates each bearer token through Supabase
+  Auth's `GET /auth/v1/user` endpoint and derives the caller ID only from that
+  verified response. It does not trust an unverified JWT claim or a user ID
+  supplied in a request body or URL. This adds an Auth request to protected API
+  calls; the verifier is behind an interface so a locally verified JWKS
+  implementation can replace it after signing-key support and rotation are
+  confirmed for the deployed Supabase project.
 - For database reads and RPC calls, the API forwards the caller's JWT to
   Supabase/PostgREST. Postgres evaluates the request under the authenticated
   user's identity and applies RLS. The API does not use a service-role key or a
@@ -544,12 +546,12 @@ PersonalExpendiure/
 │  ├─ openapi.yaml               # versioned HTTP API contract
 │  ├─ cmd/api/                   # process entrypoint and server startup
 │  ├─ internal/
-│  │  ├─ auth/                   # Supabase JWT verification and caller identity
-│  │  ├─ http/                   # routes, middleware, DTOs, error mapping
+│  │  ├─ auth/                   # Supabase token verification and caller identity
+│  │  ├─ httpapi/                # routes, auth middleware, handlers, errors
 │  │  ├─ supabase/               # caller-JWT-forwarding PostgREST/RPC client
 │  │  └─ config/                 # runtime configuration
 │  ├─ go.mod
-│  └─ tests/                     # API/auth contract and integration tests
+│  └─ .env.example               # local configuration names; no credentials
 │
 ├─ supabase/
 │  ├─ migrations/                # schema, RLS, RPCs, views, and database logic
@@ -582,6 +584,37 @@ Rules:
 - `src/api/types.ts` is generated from `backend/openapi.yaml` and never
   hand-edited. Mobile code does not use generated database-schema types because
   it does not call database tables or RPCs directly.
+
+### 6.1 Go API module view
+
+The diagram is Mermaid source stored in this document, so it can be reviewed
+and edited as code. Auth requests for signup, sign-in, and refresh stay between
+the app and Supabase Auth. Protected application requests go through the Go API;
+the API verifies the access token with Auth, then passes the same user token to
+PostgREST so database requests remain subject to RLS.
+
+```mermaid
+flowchart LR
+    App["Expo app<br/>TanStack Query"]
+    Auth["Supabase Auth"]
+    API["Go API<br/>cmd/api"]
+    Middleware["httpapi<br/>auth middleware"]
+    Verifier["auth<br/>Supabase verifier"]
+    Handler["httpapi<br/>route handlers"]
+    Adapter["supabase<br/>caller-scoped client"]
+    REST["Supabase PostgREST / RPC"]
+    DB[("Postgres<br/>RLS + SQL functions/views")]
+
+    App -->|"signup, sign-in, refresh"| Auth
+    App -->|"HTTPS + bearer access token"| API
+    API --> Middleware
+    Middleware --> Verifier
+    Verifier -->|"GET /auth/v1/user + bearer token"| Auth
+    Middleware --> Handler
+    Handler --> Adapter
+    Adapter -->|"publishable key + same caller JWT"| REST
+    REST --> DB
+```
 
 ---
 

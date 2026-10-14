@@ -92,8 +92,8 @@ that are **silent** — wrong numbers, or leaked data — rather than crashes.
   outsider reads zero rows. Test direct table access, not just app queries, or
   you are only proving the app filters politely.
 - **Go API auth suite** — reject invalid/expired tokens, derive caller identity
-  only from verified claims, ignore body-supplied identity for authorization,
-  and confirm the user JWT is forwarded so RLS applies.
+  only from Supabase Auth's verified response, ignore body-supplied identity
+  for authorization, and confirm the user JWT is forwarded so RLS applies.
 - **Split-rounding conformance** — the rounding rule exists in both SQL and
   TypeScript. A shared fixture set must drive assertions in both the Jest and
   pgTAP suites so they cannot drift.
@@ -136,6 +136,7 @@ unsettled, not merely undocumented:
 
 Backend language is decided: v1 includes one Go application API. Keep
 data-shaped logic and authoritative validation in Postgres/PL/pgSQL. Supabase
-Auth remains the identity provider; the Go API forwards the user's verified JWT
-to Supabase for user-scoped operations so RLS applies. Do not add Supabase Edge
+Auth remains the identity provider; the Go API validates the token through
+Supabase Auth and forwards the same user JWT to Supabase for user-scoped
+operations so RLS applies. Do not add Supabase Edge
 Functions or additional backend services without a concrete requirement.
