@@ -13,21 +13,23 @@ need to change a decision, change the document too, in the same commit.
 
 ## Current status
 
-**The project is not scaffolded yet.** It contains only documentation. Stack and
-conventions below describe the agreed target; the commands section applies once
-`create-expo-app` and `supabase init` have been run.
+**The project is partially scaffolded.** It contains project documentation and
+early TypeScript source, but the Expo app, Supabase stack, and Go API target
+described below are not fully scaffolded yet.
 
 ## Stack (already decided — do not substitute)
 
 - React Native + Expo, TypeScript
 - Expo Router (file-based navigation)
 - TanStack Query — the **only** owner of server data
+- Go: one stateless application data API in v1
 - Supabase: managed Postgres + Auth + Row Level Security
 - Business logic in SQL (functions + views), not TypeScript
 - Jest + jest-expo, pgTAP against the local Supabase stack
 - GitHub Actions + EAS Build + EAS Update
 
-Deliberately excluded from v1: web, desktop, Flutter, Redux, NestJS/Fastify.
+Deliberately excluded from v1: web, desktop, Flutter, Redux, and additional
+backend services beyond the single Go API.
 See the out-of-scope list in `docs/REQUIREMENTS.md` §7.
 
 ## Rules that must never be violated
@@ -39,13 +41,14 @@ that are **silent** — wrong numbers, or leaked data — rather than crashes.
    paired with an ISO-4217 currency code. Never `float`, never a decimal
    fraction. All parsing and formatting goes through `src/shared/money/`.
 2. **Postgres is the single source of truth.** Balance, budget, and report
-   aggregation lives in SQL (`src/db` calls RPCs/views). Do not compute balances
-   in TypeScript. If a second client ever needs these numbers, add SQL — never a
-   second implementation.
-3. **Row Level Security is enabled on every table**, and is the only thing
-   preventing one customer from reading another's financial data. Do not disable,
-   weaken, or add `service_role`-key code paths to client-side modules. The
-   service-role key belongs in server-only code and must never ship in the app.
+   aggregation lives in SQL (the Go API calls RPCs/views). Do not compute
+   balances in TypeScript or Go. If another client needs these numbers, add SQL —
+   never a second implementation.
+3. **Row Level Security is enabled on every table** and is the database boundary
+   preventing one customer from reading another's financial data. The Go API
+   must verify Supabase Auth tokens and forward the caller's identity so RLS
+   applies. Do not disable or weaken RLS, use service-role credentials for
+   user-scoped requests, or put privileged keys in client-side modules.
 4. **Split shares are frozen at creation.** Store the computed `share_minor` per
    participant, never a rule ("equal 3-way"). Invariant:
    `SUM(splits.amount_minor) == expenses.amount_minor` exactly, enforced by
@@ -68,8 +71,9 @@ that are **silent** — wrong numbers, or leaked data — rather than crashes.
 
 - `src/shared/` is **pure TypeScript**: no `react`, no `expo`, no
   `@supabase/supabase-js`. This is what makes it unit-testable. Keep it that way.
-- `src/db/types.ts` is **generated** from the live schema and **is committed**.
-  Never hand-edit it; regenerate instead.
+- `src/api/types.ts` is generated from `backend/openapi.yaml` and committed.
+  Never hand-edit it; regenerate instead. The mobile app does not call database
+  tables or RPCs directly.
 - `app/` routes stay thin — no business logic. Logic goes in `src/features/*`;
   pure logic in `src/shared`.
 - TanStack Query owns server data. **Do not mirror query results into Zustand,
@@ -87,6 +91,9 @@ that are **silent** — wrong numbers, or leaked data — rather than crashes.
 - **RLS suite** — seed two users sharing a Period and one outsider; assert the
   outsider reads zero rows. Test direct table access, not just app queries, or
   you are only proving the app filters politely.
+- **Go API auth suite** — reject invalid/expired tokens, derive caller identity
+  only from verified claims, ignore body-supplied identity for authorization,
+  and confirm the user JWT is forwarded so RLS applies.
 - **Split-rounding conformance** — the rounding rule exists in both SQL and
   TypeScript. A shared fixture set must drive assertions in both the Jest and
   pgTAP suites so they cannot drift.
@@ -104,7 +111,7 @@ npm run lint
 npx supabase start     # local Postgres with RLS enabled
 npx supabase db reset  # apply migrations + seed
 npx supabase test db   # pgTAP: RLS + golden dataset
-npx supabase gen types typescript --local
+cd backend; go test ./...
 ```
 
 Every migration must be applied and tested in CI against an ephemeral Supabase
@@ -124,8 +131,11 @@ unsettled, not merely undocumented:
 - **Split-rounding duplication.** The rounding rule lives in SQL (authoritative)
   and TypeScript (optimistic preview). Whether to keep both with a conformance
   test, or drop the TypeScript copy and preview from the server, is undecided.
-- **Backend language.** v1 has no application backend. If an edge function is
-  ever needed, TypeScript (Deno or Node runtime) is the preference; PL/pgSQL for
-  anything data-shaped. Decide when there is a concrete need.
 - Refunds / negative amounts, period-member removal, and the "Period" product
   name. See `docs/REQUIREMENTS.md` §9 and `docs/ARCHITECTURE.md` §9.
+
+Backend language is decided: v1 includes one Go application API. Keep
+data-shaped logic and authoritative validation in Postgres/PL/pgSQL. Supabase
+Auth remains the identity provider; the Go API forwards the user's verified JWT
+to Supabase for user-scoped operations so RLS applies. Do not add Supabase Edge
+Functions or additional backend services without a concrete requirement.

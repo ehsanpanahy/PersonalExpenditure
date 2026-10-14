@@ -110,7 +110,29 @@ one of these, the change needs an explicit decision.
 - JSON full backup, versioned via `schema_version`, covering periods, members,
   expenses, splits, budgets, and categories as nested structures.
 
-### 2.5 Offline behaviour
+### 2.5 Application API and request flow
+
+- All authenticated application data requests go through the Go API. The mobile
+  app signs in and refreshes sessions with Supabase Auth, then sends the current
+  Supabase access token to the API as a bearer token.
+- The API validates the token using a maintained Go JWT library: verify
+  signature, issuer, audience, expiry, and subject. Use the project's JWKS for
+  asymmetric signing keys; for legacy shared-secret signing, validate with the
+  Supabase Auth user endpoint. Derive caller identity only from verified claims,
+  never from a user ID supplied in a request body or URL.
+- For database reads and RPC calls, the API forwards the caller's JWT to
+  Supabase/PostgREST. Postgres evaluates the request under the authenticated
+  user's identity and applies RLS. The API does not use a service-role key or a
+  database owner connection for user-scoped requests.
+- The API provides transport, authentication verification, request/response
+  mapping, and integration orchestration. It does not calculate balances,
+  reports, budgets, or split allocations, and it does not duplicate the SQL
+  write validations.
+- Supabase Auth remains the authority for account credentials and sessions.
+  Signup, email verification, password recovery, and token refresh use Supabase
+  Auth; protected application data is accessed through the Go API.
+
+### 2.6 Offline behaviour
 
 - Reads are served from the TanStack Query cache, **persisted on device**
   (e.g. MMKV) so a cold start can render last-known data (FR-10.1, NFR-3).
@@ -169,6 +191,7 @@ Kept as an explicit, maintained list. Many of these are additive later by design
 **Infrastructure**
 - Multi-region, backups automation, disaster recovery runbook.
 - Admin dashboards and support tooling.
+- A second backend service or microservice beyond the single Go API.
 
 ---
 
@@ -180,12 +203,13 @@ Kept as an explicit, maintained list. Many of these are additive later by design
 | Navigation | **Expo Router** (file-based) | Default in new Expo apps; no navigation config file to drift out of sync. |
 | Server state | **TanStack Query** | The query cache *is* the offline-read story. Over Redux: avoids hand-maintaining a normalised expense cache that duplicates the database. |
 | Local UI state | **Context / Zustand (minimal)** | Holds only current month, dismissed onboarding, similar. Never server data. |
-| Backend | **Supabase (managed Postgres + Auth)** | Over a custom Node backend: auth is 2–4 weeks of security-sensitive work you don't need to own. RLS enforces tenant isolation in the database, so a missing `WHERE user_id = ?` in app code cannot leak data. |
-| SQL logic | **Postgres functions + views** | Balance and report math lives here so there is exactly one implementation across phone, edge functions, and future clients. |
+| Application API | **Go, one stateless HTTP API for v1** | Keeps server-only orchestration and a stable API boundary on the server. It validates Supabase access tokens and forwards the end-user JWT for database access so RLS remains effective. It does not own financial calculations or replace Supabase Auth. |
+| Backend data services | **Supabase managed Postgres + Auth** | Managed Auth handles credentials, verification, recovery, and sessions; Postgres and RLS remain authoritative for persistence and tenant isolation. |
+| SQL logic | **Postgres functions + views** | Split validation, balance and report math, and atomic data changes live here so there is exactly one implementation across the API and clients. |
 | Email | **Resend or Postmark** | **Not** Supabase's built-in SMTP: it is rate-limited to roughly 2 emails/hour on the free tier, which breaks signup and password reset in ways users experience as "the app is broken". |
 | Auth method | **Email + password** | Over OAuth: no custom URL scheme or associated-domain setup to debug in Expo. App Store rule 4.8 (Sign in with Apple) applies only if a third-party login is offered. Email + password alone does not require it. |
-| Testing | **Jest (jest-expo) + Supabase local stack + pgTAP** | Jest for TypeScript, including pure money/split logic. Local Supabase for real RLS enforcement. |
-| CI/CD | **GitHub Actions + EAS Build + EAS Update** | EAS manages signing and store submission. Hosted builds are reversible — `expo prebuild` remains available. |
+| Testing | **Go tests + Jest (jest-expo) + Supabase local stack + pgTAP** | Go tests cover API behavior; Jest covers pure TypeScript helpers; local Supabase and pgTAP prove real RLS and database behavior. |
+| CI/CD | **GitHub Actions + EAS Build + EAS Update** | CI checks the Go API, mobile app, and database migrations. EAS manages signing and store submission. Hosted builds are reversible — `expo prebuild` remains available. |
 | Lint/format | **Biome, or ESLint + Prettier** | Either is fine; pick one and don't churn. |
 
 ### Release order
@@ -441,7 +465,9 @@ pure function, unit-tested, and used identically on client and server.
 
 ### 5.5 Row Level Security
 
-Enabled on every table. The client never uses the service-role key.
+Enabled on every table. Neither the mobile app nor the Go API uses a service-role
+key for user-scoped operations. The API forwards each user's JWT so Postgres
+applies that user's RLS policies.
 
 | Table | select | insert | update | delete |
 | --- | --- | --- | --- | --- |
@@ -476,9 +502,8 @@ not only in `WITH CHECK`.
 
 ## 6. Module and folder structure
 
-A **single repository, single `package.json`** — no workspace toolchain in v1.
-The separation that matters is folders, not packages, and adding `npm
-workspaces` later (when a web app exists) is straightforward.
+A single repository contains one mobile `package.json` and one Go module under
+`backend/`. No JavaScript workspace toolchain is needed in v1.
 
 ```
 PersonalExpendiure/
@@ -497,8 +522,10 @@ PersonalExpendiure/
 │
 ├─ src/
 │  ├─ db/
-│  │  ├─ client.ts               # Supabase client + secure session persistence
-│  │  └─ types.ts                # generated from the DB schema — never hand-written
+│  │  └─ auth.ts                 # Supabase Auth + secure session persistence
+│  ├─ api/
+│  │  ├─ client.ts               # typed Go API client
+│  │  └─ types.ts                # generated from backend OpenAPI contract
 │  ├─ features/
 │  │  ├─ expenses/               # screens, hooks, components — one folder per feature
 │  │  ├─ periods/
@@ -513,9 +540,19 @@ PersonalExpendiure/
 │  ├─ ui/                        # design system: buttons, inputs, bars, charts
 │  └─ lib/                       # query keys, constants, result types
 │
+├─ backend/                      # Go API; the only application backend in v1
+│  ├─ openapi.yaml               # versioned HTTP API contract
+│  ├─ cmd/api/                   # process entrypoint and server startup
+│  ├─ internal/
+│  │  ├─ auth/                   # Supabase JWT verification and caller identity
+│  │  ├─ http/                   # routes, middleware, DTOs, error mapping
+│  │  ├─ supabase/               # caller-JWT-forwarding PostgREST/RPC client
+│  │  └─ config/                 # runtime configuration
+│  ├─ go.mod
+│  └─ tests/                     # API/auth contract and integration tests
+│
 ├─ supabase/
-│  ├─ migrations/                # ordered SQL, one concern per file
-│  ├─ functions/                 # create_expense, period_balances, totals…
+│  ├─ migrations/                # schema, RLS, RPCs, views, and database logic
 │  ├─ tests/
 │  │  ├─ rls_test.sql            # pgTAP — must fail on cross-tenant access
 │  │  └─ golden_dataset_test.sql # pinned expected balances
@@ -532,9 +569,19 @@ PersonalExpendiure/
 Rules:
 - `app/` routes are thin. Logic lives in `src/features/*`; pure logic in
   `src/shared`.
+- `backend/` is a stateless API boundary. It authenticates Supabase JWTs and
+  forwards the caller identity to Supabase/Postgres; it does not use service-role
+  credentials or reimplement data rules.
+- All app data operations go through `backend/`; Supabase Auth client calls from
+  `src/db/auth.ts` are limited to signup, verification, sign-in, recovery, and
+  session refresh. API requests use the typed client in `src/api/client.ts`.
+- `backend/openapi.yaml` is the application API contract; mobile types are
+  generated from this contract, not from the database schema.
 - `src/shared` imports nothing from `react`, `expo`, or `@supabase/supabase-js`,
   which is what makes it trivially unit-testable.
-- `src/db/types.ts` is **generated** from the live schema and never hand-edited.
+- `src/api/types.ts` is generated from `backend/openapi.yaml` and never
+  hand-edited. Mobile code does not use generated database-schema types because
+  it does not call database tables or RPCs directly.
 
 ---
 
@@ -544,13 +591,13 @@ Rules:
 | --- | --- | --- | --- |
 | 1 | Mobile-only v1 (RN + Expo) | Web-first PWA, desktop | Half the surface to build and ship. Costs: no link sharing, no desktop reporting. |
 | 2 | Expo + RN, not Flutter | Flutter | Gave up cross-platform pixel consistency to get OTA updates — a day-one fix without a store review. |
-| 3 | Supabase + RLS over a custom backend | Node/Fastify + hand-rolled auth | Tenant isolation is a database invariant, so an app-code bug cannot leak data. Cost: RLS learning curve, vendor lock-in, and service-role keys that must stay server-only. |
+| 3 | Supabase Auth/Postgres/RLS with one Go application API | Hand-rolled auth and application-owned data rules | Supabase owns credentials and tenant isolation; Go provides the v1 app API while RLS and SQL keep data authorization and financial rules authoritative. Cost: another deployable service to operate and secure. |
 | 4 | Client-generated UUIDs on expense create | Server-generated ids | Enables idempotent create now and an offline write queue later without a data migration. |
 | 5 | One currency per user and per period | Multi-currency with FX | All totals are trivially correct. The currency column already exists, so this is additive later. |
 | 6 | Integer minor units | `float` / `numeric` in JS | No cent-level drift, ever. Cost: every amount crosses the JS boundary as a number that must be formatted explicitly. |
 | 7 | Freeze computed split amounts; shared amount/splits immutable after create | Store the split rule, or allow in-place split edits | Historical balances never change meaning. Cost: changing a shared split means delete + recreate (FR-5.10). |
 | 8 | Equal + exact custom splits | Full Splitwise rule set | Validation is bounded (non-negative, must total exactly). Percentage and "N shares" are pure UI additions later. |
-| 9 | Balance and report math in SQL | Compute in TypeScript on the client | One implementation for the phone, edge functions, and any future client. They cannot disagree. |
+| 9 | Balance and report math in SQL | Compute in TypeScript or Go | One implementation for the API, phone, and any future client. They cannot disagree. |
 | 10 | Server-side write RPCs (`SECURITY DEFINER`, locked `search_path`) | Client inserts plus RLS; DEFINER-free RPCs | Validation is atomic. Direct `INSERT` on splits is revoked. Cost: DEFINER functions must be reviewed; `search_path` must stay locked. |
 | 11 | Soft-delete expenses, periods, and budgets; archive categories; tombstone on account delete | Hard delete everywhere, or soft-delete every table | Cached clients see a tombstone instead of a resurrection. Personal data is actually erased on account deletion; shared history is not (FR-1.7). |
 | 12 | Last-write-wins, no conflict engine | Optimistic locking / CRDTs | Simplicity. Accepted risk: two simultaneous edits to the same expense silently lose one. Manager-gated deletion keeps the blast radius small. |
@@ -561,7 +608,8 @@ Rules:
 | 17 | Flat categories | Nested tree | Simple schema and one-level reporting. Escape hatch is `category_groups`, which groups existing categories without migrating history. |
 | 18 | Budgets are soft warnings | Hard blocks | Nobody abandons an app because a dinner wouldn't fit under a budget. |
 | 19 | One source of truth for server data | Mirroring into a local store | TanStack Query owns all server state; local stores hold only UI state. Prevents the classic duplicated-cache divergence bug. |
-| 20 | Single package, folders for structure | npm workspaces monorepo | Avoids module-resolution and test-runner setup cost with no current second app to share code with. |
+| 20 | One mobile npm package and one Go module in a single repository | JavaScript workspaces or a multi-repository setup | Keeps mobile and API changes reviewable together without adding a workspace toolchain. |
+| 21 | Go application API in v1 | TypeScript/Node application API | A single stateless Go API provides the server boundary; Supabase Auth remains the identity provider, caller JWTs flow through to Postgres so RLS applies, and all data-shaped rules remain in SQL. |
 
 ---
 
@@ -616,19 +664,29 @@ must include the awkward cases:
 Assert the exact integer values, not just that the query returned rows. Money
 bugs produce wrong numbers, not exceptions.
 
-### 8.3 What v1 skips
+### 8.3 Go API tests
+
+The Go test suite covers request handling, authentication, and the boundary to
+Supabase. It must assert that invalid, expired, wrong-issuer, and wrong-audience
+tokens are rejected; identity comes only from verified claims; user IDs supplied
+in request payloads cannot impersonate another account; and the validated user
+JWT is forwarded on PostgREST/RPC calls. API integration tests run against the
+local Supabase stack and prove that RLS still distinguishes a member from an
+outsider. Database policy tests also access tables directly through pgTAP.
+
+### 8.4 What v1 skips
 
 - End-to-end tests. Add one Maestro flow for
   *signup → create period → add shared expense → see balances* only after the
   rest is solid.
 
-### 8.4 CI
+### 8.5 CI
 
 On every pull request:
-1. Lint and typecheck.
-2. Unit tests.
+1. Format, lint, test, and build the Go API.
+2. Lint, typecheck, and test the mobile app.
 3. Spin up an ephemeral Supabase branch, apply all migrations.
-4. Run the RLS and golden-dataset suites against it.
+4. Run Go API integration tests and the RLS and golden-dataset pgTAP suites.
 5. Report.
 
 Migrations are applied in CI, not just on developer machines. A migration that
@@ -667,4 +725,6 @@ docs): shared expenses are uncategorised; period budgets are whole-scope;
 shared amount/splits are immutable after create; account deletion tombstones
 the profile; unverified sessions cannot write; v1 golden tests do not include
 mid-period joins; Android is the v1 installable gate; category archival (not
-hard-delete of referenced categories) is the v1 rule.
+hard-delete of referenced categories) is the v1 rule. v1 includes one Go
+application API; Supabase Auth remains the identity provider, user JWTs are
+forwarded for Postgres/RLS access, and data-shaped logic stays in Postgres.

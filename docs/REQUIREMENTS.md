@@ -291,6 +291,7 @@ never depends on the device behaving well.
 | NFR-6 | The app holds no payment card details and requests no banking credentials, ever. |
 | NFR-7 | Financial calculations are covered by automated tests with known-good expected values, not merely "no errors". |
 | NFR-8 | Every database change ships as a versioned migration that is verified in continuous integration before release. |
+| NFR-9 | The v1 application data API is implemented in Go. It accepts valid Supabase Auth user tokens, derives identity from verified claims, and forwards the caller's JWT to Supabase so Row Level Security applies. It never exposes service-role credentials to the mobile app or uses them for user-scoped requests. |
 
 ---
 
@@ -348,6 +349,7 @@ to be added later **without changing the meaning of existing data.**
 **Infrastructure**
 - Automated backups and a disaster-recovery runbook.
 - An admin dashboard for support.
+- Additional application services or microservices beyond the single Go API.
 
 ---
 
