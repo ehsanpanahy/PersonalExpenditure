@@ -133,6 +133,11 @@ one of these, the change needs an explicit decision.
 - Supabase Auth remains the authority for account credentials and sessions.
   Signup, email verification, password recovery, and token refresh use Supabase
   Auth; protected application data is accessed through the Go API.
+- The first implemented data route is `GET /v1/expenses`, which returns only
+  non-deleted personal expenses within explicit inclusive `from`/`to` dates.
+  The API forwards a fixed PostgREST query under the caller's JWT; RLS enforces
+  ownership. `amount_minor` is encoded as a decimal string at the mobile API
+  boundary to preserve PostgreSQL `bigint` precision in JavaScript.
 
 ### 2.6 Offline behaviour
 
@@ -227,6 +232,11 @@ Kept as an explicit, maintained list. Many of these are additive later by design
 All timestamps are `timestamptz` in UTC. All dates are `date` (no time, no
 zone). All amounts are `bigint` minor units.
 
+The initial migration implements the profile, category, period-membership, and
+expense tables needed by the first read endpoint. Expenses are read-only through
+the current app API; SQL write RPCs and the remaining budgets/splits schema will
+be added with their corresponding API features.
+
 ### 5.1 Tables
 
 #### `profiles`
@@ -239,7 +249,7 @@ stable public identity. Auth can go away without deleting shared history.
 | `auth_user_id` | `uuid` | → `auth.users(id)` `ON DELETE SET NULL`. Unique while set. Null on a tombstone. |
 | `email` | `text` | Null on a tombstone. |
 | `display_name` | `text` | nullable; null on a tombstone |
-| `base_currency` | `char(3)` | ISO-4217. Every personal amount uses this. |
+| `base_currency` | `char(3)` | nullable until onboarding; then ISO-4217. Every personal amount uses this. |
 | `timezone` | `text` | IANA, e.g. `Europe/Berlin`. Used in v1 for "today" and month bounds. |
 | `deleted_at` | `timestamptz` | nullable — set when the account is deleted (tombstone) |
 | `created_at` / `updated_at` | `timestamptz` | |
@@ -548,6 +558,7 @@ PersonalExpendiure/
 │  ├─ internal/
 │  │  ├─ auth/                   # Supabase token verification and caller identity
 │  │  ├─ httpapi/                # routes, auth middleware, handlers, errors
+│  │  │  └─ expenses.go          # personal expense list endpoint
 │  │  ├─ supabase/               # caller-JWT-forwarding PostgREST/RPC client
 │  │  └─ config/                 # runtime configuration
 │  ├─ go.mod
@@ -556,9 +567,9 @@ PersonalExpendiure/
 ├─ supabase/
 │  ├─ migrations/                # schema, RLS, RPCs, views, and database logic
 │  ├─ tests/
-│  │  ├─ rls_test.sql            # pgTAP — must fail on cross-tenant access
+│  │  ├─ expense_rls_test.sql    # pgTAP — direct RLS coverage for expense reads
 │  │  └─ golden_dataset_test.sql # pinned expected balances
-│  ├─ seed.sql                   # starter categories per test user
+│  ├─ seed.sql                   # no invented user or expense data
 │  └─ config.toml
 │
 ├─ e2e/                          # Maestro flows — optional, added after v1
@@ -574,6 +585,9 @@ Rules:
 - `backend/` is a stateless API boundary. It authenticates Supabase JWTs and
   forwards the caller identity to Supabase/Postgres; it does not use service-role
   credentials or reimplement data rules.
+- `GET /v1/expenses` sends explicit date filters and pagination to PostgREST;
+  the returned rows remain tenant-scoped by RLS. Month bounds are computed by
+  the client in the user's IANA time zone, never inferred by the Go API.
 - All app data operations go through `backend/`; Supabase Auth client calls from
   `src/db/auth.ts` are limited to signup, verification, sign-in, recovery, and
   session refresh. API requests use the typed client in `src/api/client.ts`.

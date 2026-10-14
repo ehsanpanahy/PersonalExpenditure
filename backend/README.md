@@ -15,14 +15,20 @@ budgets, and reports remain in Postgres functions and views.
 - `GET /healthz` is an unauthenticated liveness check.
 - `GET /v1/me` is a protected identity check returning the user ID verified by
   Supabase Auth.
-- `internal/supabase` contains the request-scoped PostgREST/RPC transport for
-  feature routes that will be added with their API contracts.
-- `openapi.yaml` is the contract for the currently implemented routes. Extend it
-  before adding app-facing endpoints; generate mobile API types from it.
+- `GET /v1/expenses?from=YYYY-MM-DD&to=YYYY-MM-DD` lists non-deleted personal
+  expenses for an explicit inclusive date range. Optional pagination uses
+  `limit` (default 50, max 100) and `offset` (max 10000). Shared expenses are
+  excluded by the query and tenant visibility is enforced by RLS.
+- Expense amounts are returned as decimal strings to preserve Postgres `bigint`
+  precision in JavaScript clients.
+- `supabase/migrations/20261014000000_expense_read_schema.sql` creates the
+  profile/category/period/expense tables and RLS policies needed for the read
+  path. Expense writes remain unavailable until the SQL RPCs are implemented.
+- `openapi.yaml` is the API contract; generate mobile API types from it.
 
-This is the backend foundation, not the complete expense API. Feature endpoints
-for expenses, periods, budgets, reports, and exports remain to be designed and
-implemented.
+This is the backend foundation plus the first read-only expense endpoint.
+Expense creation/edit/deletion, periods, budgets, reports, and exports remain
+to be designed and implemented.
 
 ## Run locally
 
@@ -32,6 +38,10 @@ implemented.
    key).
 3. From `backend/`, run `go run ./cmd/api`.
 4. Check `GET http://localhost:8080/healthz`.
+
+Production deployments must expose the API only over HTTPS, either directly or
+through a TLS-terminating reverse proxy. Never send bearer tokens over plaintext
+HTTP outside local development.
 
 For `/v1/me`, sign in through Supabase Auth and send the resulting access token:
 

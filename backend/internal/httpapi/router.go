@@ -7,9 +7,10 @@ import (
 	"net/http"
 
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/auth"
+	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/supabase"
 )
 
-func NewRouter(verifier auth.Verifier, logger *slog.Logger) http.Handler {
+func NewRouter(verifier auth.Verifier, supabaseClient *supabase.Client, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -17,6 +18,7 @@ func NewRouter(verifier auth.Verifier, logger *slog.Logger) http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 	mux.Handle("GET /v1/me", requireAuth(verifier, logger)(http.HandlerFunc(meHandler)))
+	mux.Handle("GET /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(listPersonalExpenses(supabaseClient, logger))))
 	return mux
 }
 

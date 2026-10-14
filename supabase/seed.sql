@@ -1,0 +1,3 @@
+-- No fake product data is seeded. Auth-triggered profile creation is covered
+-- by supabase/tests/expense_rls_test.sql; starter categories remain a product
+-- list decision and will be added with the category onboarding flow.

@@ -46,6 +46,77 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '503':
           $ref: '#/components/responses/IdentityProviderUnavailable'
+  /v1/expenses:
+    get:
+      operationId: listPersonalExpenses
+      summary: List the authenticated user's personal expenses
+      description: >-
+        Returns non-deleted personal expenses within explicit inclusive date
+        bounds. Shared expenses are excluded. Results are ordered newest first.
+      security:
+        - supabaseBearer: []
+      parameters:
+        - name: from
+          in: query
+          required: true
+          description: Inclusive start date; compute month boundaries in the user's IANA timezone.
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: true
+          description: Inclusive end date; compute month boundaries in the user's IANA timezone.
+          schema:
+            type: string
+            format: date
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+            default: 0
+      responses:
+        '200':
+          description: Personal expenses; amount_minor is encoded as a decimal string to preserve bigint precision.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PersonalExpense'
+        '400':
+          description: Invalid or missing date range or pagination parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/IdentityProviderUnavailable'
+        '403':
+          description: The request is not permitted by Supabase
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Supabase data service failed or returned an invalid response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 components:
   securitySchemes:
     supabaseBearer:
@@ -53,6 +124,31 @@ components:
       scheme: bearer
       bearerFormat: JWT
   schemas:
+    PersonalExpense:
+      type: object
+      required: [id, amount_minor, currency, occurred_on, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        amount_minor:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Integer minor units represented as a string to preserve bigint precision.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        occurred_on:
+          type: string
+          format: date
+        category_id:
+          type: [string, 'null']
+          format: uuid
+        note:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
     Error:
       type: object
       required: [error]
