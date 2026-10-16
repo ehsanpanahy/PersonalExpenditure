@@ -102,3 +102,12 @@ desktop.ini
 # Build / test output
 dist/
 coverage/
+
+# Go build and test artifacts
+.gocache-review/
+*.exe
+*.test
+*.out
+*.prof
+*.coverprofile
+/backend/bin/

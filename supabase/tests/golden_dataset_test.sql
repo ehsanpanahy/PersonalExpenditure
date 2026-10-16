@@ -215,10 +215,10 @@ SELECT is(
     2500::bigint, 'personal March total is 2500 (shared costs never merged, BR-6)');
 RESET ROLE;
 
--- ----------------------- §C rounding conformance via RPC (P2, as A) ----
+-- ----------------------- §C rounding conformance via restricted RPC (P2, as A) ----
 -- Mirrors src/shared/splits/conformance.json case "1000/3".
 
-SET ROLE authenticated;
+SET ROLE app_api;
 SELECT set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000011', true);
 SELECT lives_ok(
     $$SELECT public.create_expense(
@@ -292,9 +292,9 @@ SELECT throws_ok(
 );
 RESET ROLE;
 
--- --------------------------------- §D RPC authorisation (P2) ----
+-- --------------------------------- §D restricted RPC authorisation (P2) ----
 
-SET ROLE authenticated;
+SET ROLE app_api;
 SELECT set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000014', true);
 SELECT throws_ok(
     $$SELECT public.create_expense(
@@ -372,9 +372,9 @@ SELECT throws_ok(
 );
 RESET ROLE;
 
--- --------------------------------- §E update / delete rules (as A) ----
+-- --------------------------------- §E SQL conformance for legacy writes (as A) ----
 
-SET ROLE authenticated;
+SET ROLE app_api;
 SELECT set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000011', true);
 SELECT lives_ok(
     $$SELECT public.create_expense(

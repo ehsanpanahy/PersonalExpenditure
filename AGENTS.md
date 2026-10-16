@@ -24,7 +24,8 @@ described below are not fully scaffolded yet.
 - TanStack Query — the **only** owner of server data
 - Go: one stateless application data API in v1
 - Supabase: managed Postgres + Auth + Row Level Security
-- Business logic in SQL (functions + views), not TypeScript
+- Application workflows and authoritative request validation in Go; Postgres
+  owns RLS, constraints, atomic integrity, and balance/report aggregates
 - Jest + jest-expo, pgTAP against the local Supabase stack
 - GitHub Actions + EAS Build + EAS Update
 
@@ -40,19 +41,22 @@ that are **silent** — wrong numbers, or leaked data — rather than crashes.
 1. **Money is always an integer count of minor units** (`amount_minor bigint`),
    paired with an ISO-4217 currency code. Never `float`, never a decimal
    fraction. All parsing and formatting goes through `src/shared/money/`.
-2. **Postgres is the single source of truth.** Balance, budget, and report
-   aggregation lives in SQL (the Go API calls RPCs/views). Do not compute
-   balances in TypeScript or Go. If another client needs these numbers, add SQL —
-   never a second implementation.
+2. **Postgres is the source of truth for persisted data and aggregates.** Balance,
+   budget, and report aggregation lives in SQL. Do not compute these figures in
+   TypeScript or Go. The Go API owns application workflows and authoritative
+   request validation; Postgres remains responsible for RLS, database
+   constraints, and atomic integrity. Keep those database safeguards even when
+   Go performs the user-facing business-rule checks.
 3. **Row Level Security is enabled on every table** and is the database boundary
    preventing one customer from reading another's financial data. The Go API
-   must verify Supabase Auth tokens and forward the caller's identity so RLS
-   applies. Do not disable or weaken RLS, use service-role credentials for
-   user-scoped requests, or put privileged keys in client-side modules.
+   must verify Supabase Auth tokens. Reads forward the caller's JWT; writes set
+   only verified caller claims inside a restricted `app_api` transaction before
+   querying Postgres. Do not disable or weaken RLS, use service-role credentials
+   for user-scoped requests, or put privileged keys in client-side modules.
 4. **Split shares are frozen at creation.** Store the computed `share_minor` per
    participant, never a rule ("equal 3-way"). Invariant:
    `SUM(splits.amount_minor) == expenses.amount_minor` exactly, enforced by
-   `create_expense()` and asserted in tests.
+   one transaction and enforced by a deferred Postgres integrity trigger.
 5. **Soft delete everywhere** (`deleted_at`). Only account deletion erases data.
    A hard-deleted row can resurrect in a client's cache because a refetching
    client that already holds it never learns it is gone.
@@ -93,7 +97,8 @@ that are **silent** — wrong numbers, or leaked data — rather than crashes.
   you are only proving the app filters politely.
 - **Go API auth suite** — reject invalid/expired tokens, derive caller identity
   only from Supabase Auth's verified response, ignore body-supplied identity
-  for authorization, and confirm the user JWT is forwarded so RLS applies.
+  for authorization, and confirm reads forward the JWT and writes install only
+  verified claims under the restricted role so RLS applies.
 - **Split-rounding conformance** — the rounding rule exists in both SQL and
   TypeScript. A shared fixture set must drive assertions in both the Jest and
   pgTAP suites so they cannot drift.
@@ -134,9 +139,10 @@ unsettled, not merely undocumented:
 - Refunds / negative amounts, period-member removal, and the "Period" product
   name. See `docs/REQUIREMENTS.md` §9 and `docs/ARCHITECTURE.md` §9.
 
-Backend language is decided: v1 includes one Go application API. Keep
-data-shaped logic and authoritative validation in Postgres/PL/pgSQL. Supabase
-Auth remains the identity provider; the Go API validates the token through
-Supabase Auth and forwards the same user JWT to Supabase for user-scoped
-operations so RLS applies. Do not add Supabase Edge
+Backend language is decided: v1 includes one Go application API. Go owns
+server-side application workflows and authoritative request validation.
+Postgres owns persisted data, RLS, database constraints, atomic integrity, and
+balance/report aggregates. Supabase Auth remains the identity provider; the Go
+API validates tokens through Auth and preserves verified caller identity for
+user-scoped database operations so RLS applies. Do not add Supabase Edge
 Functions or additional backend services without a concrete requirement.

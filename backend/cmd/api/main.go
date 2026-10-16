@@ -13,6 +13,7 @@ import (
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/auth"
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/config"
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/httpapi"
+	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/postgres"
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/supabase"
 )
 
@@ -28,9 +29,16 @@ func main() {
 	upstreamClient := &http.Client{Timeout: cfg.UpstreamTimeout}
 	verifier := auth.NewSupabaseVerifier(cfg.SupabaseURL, cfg.SupabasePublishableKey, upstreamClient)
 	supabaseClient := supabase.NewClient(cfg.SupabaseURL, cfg.SupabasePublishableKey, upstreamClient)
+	db, err := postgres.Open(context.Background(), cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("PostgreSQL unavailable", "error", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	store := postgres.NewStore(db)
 	server := &http.Server{
 		Addr:              cfg.Address,
-		Handler:           httpapi.NewRouter(verifier, supabaseClient, logger),
+		Handler:           httpapi.NewRouterWithPostgres(verifier, supabaseClient, store, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

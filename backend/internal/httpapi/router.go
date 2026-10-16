@@ -7,10 +7,19 @@ import (
 	"net/http"
 
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/auth"
+	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/postgres"
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/supabase"
 )
 
 func NewRouter(verifier auth.Verifier, supabaseClient *supabase.Client, logger *slog.Logger) http.Handler {
+	return newRouter(verifier, supabaseClient, nil, logger)
+}
+
+func NewRouterWithPostgres(verifier auth.Verifier, supabaseClient *supabase.Client, store *postgres.Store, logger *slog.Logger) http.Handler {
+	return newRouter(verifier, supabaseClient, store, logger)
+}
+
+func newRouter(verifier auth.Verifier, supabaseClient *supabase.Client, store *postgres.Store, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -19,7 +28,11 @@ func NewRouter(verifier auth.Verifier, supabaseClient *supabase.Client, logger *
 	})
 	mux.Handle("GET /v1/me", requireAuth(verifier, logger)(http.HandlerFunc(meHandler)))
 	mux.Handle("GET /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(listPersonalExpenses(supabaseClient, logger))))
-	mux.Handle("POST /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(createExpense(supabaseClient, logger))))
+	createHandler := createExpense(supabaseClient, logger)
+	if store != nil {
+		createHandler = createExpenseWithPostgres(store, logger)
+	}
+	mux.Handle("POST /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(createHandler)))
 	return mux
 }
 

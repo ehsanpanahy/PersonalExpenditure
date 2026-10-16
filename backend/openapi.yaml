@@ -112,7 +112,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '502':
-          description: Supabase data service failed or returned an invalid response
+          description: Supabase or PostgreSQL data service failed or returned an invalid response
           content:
             application/json:
               schema:
@@ -121,13 +121,13 @@ paths:
       operationId: createExpense
       summary: Record a personal or shared expense
       description: >-
-        Validates the request at the transport boundary, then calls the
-        `create_expense` SQL RPC under the caller's JWT. The RPC is
-        authoritative: membership, date ranges, currency, and the exact
-        split-total invariant are re-checked in Postgres and rejected, never
+        Go validates the application rules and writes the expense and frozen
+        splits in one Postgres transaction under the verified caller's RLS
+        context. Postgres independently enforces row access and the exact
+        split-total integrity invariant; invalid requests are rejected, never
         corrected. The expense author is always the authenticated caller;
-        `paid_by` and split members are validated as period members by the
-        RPC. The id is client-generated: retrying with the same id and
+        `paid_by` and split members are validated as period members by Go. The
+        id is client-generated: retrying with the same id and
         identical payload returns the same id (201); the same id with a
         different payload is a 409 conflict.
       security:
@@ -174,7 +174,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '502':
-          description: Supabase data service failed or returned an invalid response
+          description: Supabase or PostgreSQL data service failed or returned an invalid response
           content:
             application/json:
               schema:

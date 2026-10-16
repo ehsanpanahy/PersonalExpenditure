@@ -27,8 +27,12 @@ Two things define the product:
 These are the rules the rest of the document follows from. If a change violates
 one of these, the change needs an explicit decision.
 
-- **Postgres is the single source of truth.** All balance, budget, and report
-  math lives in SQL, not in TypeScript. The phone is a cache and a renderer.
+- **Go owns application workflows; Postgres owns data enforcement and
+  aggregates.** Go performs authoritative server-side request validation and
+  orchestrates application operations. Postgres enforces RLS, database
+  constraints, and atomic integrity, and computes balance, budget, and report
+  aggregates. TypeScript validation is for UX only. The phone is a cache and a
+  renderer.
 - **Tenant isolation is enforced in the database**, via Row Level Security, not
   in application code.
 - **Money is never a float.** Every amount is an integer count of minor units
@@ -50,8 +54,8 @@ one of these, the change needs an explicit decision.
 
 - Email + password signup, email verification, password reset, logout.
 - **Unverified accounts cannot be used (FR-1.2).** Supabase requires a confirmed
-  email before issuing a usable session. RLS and every write RPC also refuse
-  `auth.uid()` unless `profiles.auth_user_id` is set and `deleted_at` is null.
+  email before issuing a usable session. RLS and Go write workflows also refuse
+  callers without a live profile linked to the verified Auth identity.
 - Sessions: Supabase JWT + refresh tokens in device secure storage.
 - Onboarding: a single screen asking for base currency, then confirming starter
   categories. IANA time zone is taken from the device and can be changed in
@@ -122,22 +126,24 @@ one of these, the change needs an explicit decision.
   calls; the verifier is behind an interface so a locally verified JWKS
   implementation can replace it after signing-key support and rotation are
   confirmed for the deployed Supabase project.
-- For database reads and RPC calls, the API forwards the caller's JWT to
-  Supabase/PostgREST. Postgres evaluates the request under the authenticated
-  user's identity and applies RLS. The API does not use a service-role key or a
-  database owner connection for user-scoped requests.
-- The API provides transport, authentication verification, request/response
-  mapping, and integration orchestration. It does not calculate balances,
-  reports, budgets, or split allocations, and it does not duplicate the SQL
-  write validations.
+- For database reads, the API forwards the caller's JWT to Supabase/PostgREST.
+  For Go-owned writes, it opens a transaction, installs claims from the
+  verified caller, and switches to the restricted `app_api` database role
+  before issuing queries. RLS therefore evaluates each operation as the caller.
+  The Go code must never issue user queries outside that scoped transaction.
+- The API provides transport, authentication verification, authoritative
+  application-rule validation, request/response mapping, and integration
+  orchestration. It does not calculate balances, reports, or budgets. Database
+  constraints and transactional write checks remain as integrity safeguards;
+  they do not replace Go's API-level validation.
 - Supabase Auth remains the authority for account credentials and sessions.
   Signup, email verification, password recovery, and token refresh use Supabase
   Auth; protected application data is accessed through the Go API.
-- The first implemented data route is `GET /v1/expenses`, which returns only
-  non-deleted personal expenses within explicit inclusive `from`/`to` dates.
-  The API forwards a fixed PostgREST query under the caller's JWT; RLS enforces
-  ownership. `amount_minor` is encoded as a decimal string at the mobile API
-  boundary to preserve PostgreSQL `bigint` precision in JavaScript.
+- The implemented expense routes include `GET /v1/expenses` and
+  `POST /v1/expenses`. Reads use a fixed PostgREST query under the caller's JWT;
+  writes use a verified-identity transaction under `app_api`. `amount_minor`
+  is encoded as a decimal string at the mobile API boundary to preserve
+  PostgreSQL `bigint` precision in JavaScript.
 
 ### 2.6 Offline behaviour
 
@@ -210,9 +216,9 @@ Kept as an explicit, maintained list. Many of these are additive later by design
 | Navigation | **Expo Router** (file-based) | Default in new Expo apps; no navigation config file to drift out of sync. |
 | Server state | **TanStack Query** | The query cache *is* the offline-read story. Over Redux: avoids hand-maintaining a normalised expense cache that duplicates the database. |
 | Local UI state | **Context / Zustand (minimal)** | Holds only current month, dismissed onboarding, similar. Never server data. |
-| Application API | **Go, one stateless HTTP API for v1** | Keeps server-only orchestration and a stable API boundary on the server. It validates Supabase access tokens and forwards the end-user JWT for database access so RLS remains effective. It does not own financial calculations or replace Supabase Auth. |
+| Application API | **Go, one stateless HTTP API for v1** | Owns application workflows and authoritative request validation, provides a stable API boundary, validates Supabase access tokens, and preserves the end-user identity for database access so RLS remains effective. It does not replace Supabase Auth. |
 | Backend data services | **Supabase managed Postgres + Auth** | Managed Auth handles credentials, verification, recovery, and sessions; Postgres and RLS remain authoritative for persistence and tenant isolation. |
-| SQL logic | **Postgres functions + views** | Split validation, balance and report math, and atomic data changes live here so there is exactly one implementation across the API and clients. |
+| Database enforcement and aggregates | **Postgres RLS, constraints, transactions, functions + views** | RLS protects tenant data; constraints and transactions preserve persisted integrity; SQL owns balance and report aggregates. Go owns application workflows and server-side request validation. |
 | Email | **Resend or Postmark** | **Not** Supabase's built-in SMTP: it is rate-limited to roughly 2 emails/hour on the free tier, which breaks signup and password reset in ways users experience as "the app is broken". |
 | Auth method | **Email + password** | Over OAuth: no custom URL scheme or associated-domain setup to debug in Expo. App Store rule 4.8 (Sign in with Apple) applies only if a third-party login is offered. Email + password alone does not require it. |
 | Testing | **Go tests + Jest (jest-expo) + Supabase local stack + pgTAP** | Go tests cover API behavior; Jest covers pure TypeScript helpers; local Supabase and pgTAP prove real RLS and database behavior. |
@@ -232,10 +238,10 @@ Kept as an explicit, maintained list. Many of these are additive later by design
 All timestamps are `timestamptz` in UTC. All dates are `date` (no time, no
 zone). All amounts are `bigint` minor units.
 
-The initial migration implements the profile, category, period-membership, and
-expense tables needed by the first read endpoint. Expenses are read-only through
-the current app API; SQL write RPCs and the remaining budgets/splits schema will
-be added with their corresponding API features.
+The initial migrations implement the profile, category, period-membership,
+expense, and split tables. The current Go API supports personal expense reads
+and personal/shared expense creation; write workflows are in Go, with RLS and
+database integrity safeguards in Postgres.
 
 ### 5.1 Tables
 
@@ -347,7 +353,7 @@ Constraints:
 - `UNIQUE (expense_id, user_id)`
 - Index `(user_id)` for `owes_minor`.
 - **Invariant: `SUM(amount_minor) == expenses.amount_minor`** for every expense.
-  Enforced in `create_expense()` / `update_expense()`; asserted in tests.
+  Enforced by a deferred database trigger; asserted in tests.
 
 A personal expense has exactly **one** split row: its owner, for the full
 amount. This unifies the balance query — there is no separate code path for
@@ -383,53 +389,39 @@ Cycle: **calendar month**, 1st to last, in the relevant zone (user timezone for
 personal; still passed as `(from, to)` dates). Budgets are **soft warnings** —
 the app never blocks recording an expense.
 
-### 5.2 Derived logic (Postgres)
+### 5.2 Application rules (Go) and database enforcement
 
-Write RPCs (`create_expense`, `update_expense`, `soft_delete_expense`,
-`create_period`, `transfer_manager`, `soft_delete_period`, `delete_account`)
-are `SECURITY DEFINER` with `SET search_path = pg_catalog, public`. Direct
-`INSERT`/`UPDATE`/`DELETE` on `expense_splits` is revoked from `authenticated`.
-This is the only way "splits via RPC only" is actually true. Helpers used from
-RLS (`is_period_member(uid, pid)`) are also `SECURITY DEFINER` with a locked
-`search_path`, so `periods` and `period_members` policies do not recurse.
+Application workflows and request validation live in Go. Postgres functions
+remain appropriate for RLS helpers and aggregate queries; database constraints,
+grants, policies, and triggers protect persisted integrity. `app_api` is a
+non-login role that inherits the authenticated user's permitted reads and has
+narrow expense/split insert grants. A separate `app_api_login` role is
+provisioned with a secret outside migrations and can only assume `app_api`.
+RLS helpers such as `is_live_period_member(uid, pid)` remain database functions
+to avoid recursive policy checks.
 
-#### `create_expense(...) → uuid`
-The app's main write path and the main trust boundary. One transaction.
+#### Expense writes (Go workflow + Postgres safeguards)
+`POST /v1/expenses` is implemented in `backend/internal/postgres/expenses.go`.
+Go authenticates the request through the verified `auth.Session`, validates
+the payload and business rules, and performs all context reads plus the expense
+and split inserts in one transaction. The transaction sets local JWT claims
+from the verified Supabase user ID and switches to `app_api`; it never trusts
+identity supplied by the request body.
 
-1. Authorise: the caller must be the `user_id`, with a live (non-tombstone)
-   profile, and if `period_id` is set, the caller must be a member of that
-   live period.
-2. Validate the date:
-   - `occurred_on` must not be after **today** in the author's `profiles.timezone`.
-     **Reject, never clamp.**
-   - If shared, `occurred_on` must also fall within `[starts_on, ends_on]` of
-     the period, inclusive. **Reject, never clamp.**
-3. Validate participants: every split `user_id` must be a current member of
-   the period (or the owner, for a personal expense). Excluded members are
-   omitted, not stored as zero.
-4. Validate amounts: each split `amount_minor > 0`, and `SUM(splits) ==
-   amount_minor` exactly. No tolerance.
-5. Shared expenses: force `category_id` null. Personal: `currency` must equal
-   `base_currency`; shared: equal the period currency.
-6. Insert the expense, insert the splits.
-7. Return the new id.
+Go checks the caller profile, personal category ownership or period membership,
+the period date range and currency, the user's local `today`, the payer and
+split participants, positive integer shares, exact split sum, and create
+idempotency. RLS limits rows visible to the caller. The mobile-facing
+`authenticated` role has no expense/split write grants. A deferred trigger
+rejects an expense with no splits or a mismatched sum at transaction commit.
 
-Idempotency: because the id is client-generated,
-- same id **and** same payload → success (return the id);
-- same id **and** a different payload → conflict (do not overwrite);
-- new id → insert.
-
-#### `update_expense(...)`
-Author of the row, or the period manager.
-
-- **Personal:** amount, `occurred_on`, `category_id`, `note`. An amount change
-  rewrites the single owner split in the same transaction so the sum invariant
-  holds.
-- **Shared:** `occurred_on` and `note` only. Amount and splits are rejected
-  (FR-5.10). Date rules are the same as create.
-
-#### `soft_delete_expense(...)`
-Sets `deleted_at`. Author of own, or period manager. Does not touch splits.
+Future update, soft-delete, period, budget, and account workflows belong in Go
+and must use equivalent caller-scoped transactions. Database constraints and
+RLS remain enforcement safeguards. The old SQL write RPCs are executable only
+by `app_api` for existing pgTAP conformance fixtures; the Go API does not call
+them and mobile-authenticated clients cannot use them as an alternate write
+path. Remove those legacy functions when the fixtures migrate to direct
+seed/setup plus Go API assertions.
 
 #### `expense_totals(scope, from, to)`
 Report aggregates. Scope is `('user', user_id)` or `('period', period_id)`.
@@ -477,19 +469,20 @@ pure function, unit-tested, and used identically on client and server.
 
 ### 5.5 Row Level Security
 
-Enabled on every table. Neither the mobile app nor the Go API uses a service-role
-key for user-scoped operations. The API forwards each user's JWT so Postgres
-applies that user's RLS policies.
+Enabled on every table. The mobile app never uses a service-role key. Read
+requests forward the caller JWT. Go writes use the restricted `app_api` role
+with verified caller claims set transaction-locally, so Postgres applies the
+caller's RLS policies. The application login must not be a RLS-bypass role.
 
 | Table | select | insert | update | delete |
 | --- | --- | --- | --- | --- |
 | `profiles` | own live row | — (trigger on `auth.users`) | own live row | — (via `delete_account()`) |
-| `categories` | own | own | own | own (archive preferred; hard delete rejected if referenced) |
-| `periods` | member of a live period | via `create_period()` | manager | via `soft_delete_period()` |
-| `period_members` | member of that live period | via `create_period()` | via `transfer_manager()` | via `delete_account()` |
-| `expenses` | own personal, **or** member of its live period | via `create_expense()` | via `update_expense()` | via `soft_delete_expense()` |
-| `expense_splits` | same as parent expense | via `create_expense()` only | via `update_expense()` only | with parent |
-| `budgets` | own personal, or member of the period for a period budget | own personal, or period manager for a period budget | same as insert | same (soft) |
+| `categories` | own | Go workflow (owner scope) | Go workflow (owner scope) | Go workflow (archive preferred; hard delete rejected if referenced) |
+| `periods` | member of a live period | Go workflow | Go workflow (manager) | Go workflow (manager soft-delete) |
+| `period_members` | member of that live period | Go workflow | Go workflow (manager transfer) | Go workflow (account deletion only) |
+| `expenses` | own personal, **or** member of its live period | Go `app_api` role: caller-owned personal or period member | Go workflow (future endpoint) | Go workflow (future endpoint) |
+| `expense_splits` | same as parent expense | Go `app_api` role: caller-created expense only | Go workflow (future endpoint) | with parent |
+| `budgets` | own personal, or member of the period for a period budget | Go workflow (owner or period manager) | Go workflow (owner or period manager) | Go workflow (soft delete) |
 
 Live period means `periods.deleted_at IS NULL`. Membership checks go through
 `is_period_member(auth.uid(), period_id)`, not a raw subquery, to avoid RLS
@@ -507,8 +500,11 @@ USING (
 A former member whose `period_members` row was removed sees **zero** rows from
 that period (BR-8). Tombstone profiles are not selectable by their former owner.
 
-Write checks (membership, date range, currency, split sum) live in the RPCs,
-not only in `WITH CHECK`.
+Go validates membership, date range, currency, and split participants before
+writing. RLS still checks row ownership/membership, table grants prevent the
+mobile `authenticated` role from writing expenses or splits directly, and a
+deferred database trigger enforces that every expense has at least one split
+whose total equals the expense amount.
 
 ---
 
@@ -559,13 +555,14 @@ PersonalExpendiure/
 │  │  ├─ auth/                   # Supabase token verification and caller identity
 │  │  ├─ httpapi/                # routes, auth middleware, handlers, errors
 │  │  │  └─ expenses.go          # personal expense list endpoint
-│  │  ├─ supabase/               # caller-JWT-forwarding PostgREST/RPC client
+│  │  ├─ supabase/               # caller-JWT-forwarding PostgREST read client
+│  │  ├─ postgres/               # caller-scoped RLS transactions and writes
 │  │  └─ config/                 # runtime configuration
 │  ├─ go.mod
 │  └─ .env.example               # local configuration names; no credentials
 │
 ├─ supabase/
-│  ├─ migrations/                # schema, RLS, RPCs, views, and database logic
+│  ├─ migrations/                # schema, RLS, integrity triggers, and aggregates
 │  ├─ tests/
 │  │  ├─ expense_rls_test.sql    # pgTAP — direct RLS coverage for expense reads
 │  │  └─ golden_dataset_test.sql # pinned expected balances
@@ -582,9 +579,10 @@ PersonalExpendiure/
 Rules:
 - `app/` routes are thin. Logic lives in `src/features/*`; pure logic in
   `src/shared`.
-- `backend/` is a stateless API boundary. It authenticates Supabase JWTs and
-  forwards the caller identity to Supabase/Postgres; it does not use service-role
-  credentials or reimplement data rules.
+- `backend/` is a stateless API boundary. It authenticates Supabase JWTs. Reads
+  forward caller tokens to PostgREST; writes use a restricted Postgres role and
+  transaction-local verified claims so RLS remains effective. Go owns application
+  rules; SQL owns constraints, RLS, and aggregates.
 - `GET /v1/expenses` sends explicit date filters and pagination to PostgREST;
   the returned rows remain tenant-scoped by RLS. Month bounds are computed by
   the client in the user's IANA time zone, never inferred by the Go API.
@@ -604,8 +602,8 @@ Rules:
 The diagram is Mermaid source stored in this document, so it can be reviewed
 and edited as code. Auth requests for signup, sign-in, and refresh stay between
 the app and Supabase Auth. Protected application requests go through the Go API;
-the API verifies the access token with Auth, then passes the same user token to
-PostgREST so database requests remain subject to RLS.
+the API verifies the access token with Auth, forwards it for reads, and installs
+the verified identity in a restricted Postgres transaction for writes.
 
 ```mermaid
 flowchart LR
@@ -615,9 +613,10 @@ flowchart LR
     Middleware["httpapi<br/>auth middleware"]
     Verifier["auth<br/>Supabase verifier"]
     Handler["httpapi<br/>route handlers"]
-    Adapter["supabase<br/>caller-scoped client"]
-    REST["Supabase PostgREST / RPC"]
-    DB[("Postgres<br/>RLS + SQL functions/views")]
+    Adapter["supabase<br/>caller-JWT read client"]
+    Store["postgres<br/>RLS-scoped transaction"]
+    REST["Supabase PostgREST"]
+    DB[("Postgres<br/>RLS + constraints + aggregates")]
 
     App -->|"signup, sign-in, refresh"| Auth
     App -->|"HTTPS + bearer access token"| API
@@ -626,8 +625,10 @@ flowchart LR
     Verifier -->|"GET /auth/v1/user + bearer token"| Auth
     Middleware --> Handler
     Handler --> Adapter
-    Adapter -->|"publishable key + same caller JWT"| REST
+    Handler --> Store
+    Adapter -->|"publishable key + caller JWT"| REST
     REST --> DB
+    Store -->|"verified claims + app_api role"| DB
 ```
 
 ---
@@ -638,14 +639,14 @@ flowchart LR
 | --- | --- | --- | --- |
 | 1 | Mobile-only v1 (RN + Expo) | Web-first PWA, desktop | Half the surface to build and ship. Costs: no link sharing, no desktop reporting. |
 | 2 | Expo + RN, not Flutter | Flutter | Gave up cross-platform pixel consistency to get OTA updates — a day-one fix without a store review. |
-| 3 | Supabase Auth/Postgres/RLS with one Go application API | Hand-rolled auth and application-owned data rules | Supabase owns credentials and tenant isolation; Go provides the v1 app API while RLS and SQL keep data authorization and financial rules authoritative. Cost: another deployable service to operate and secure. |
+| 3 | Supabase Auth/Postgres/RLS with one Go application API | Hand-rolled auth or client-owned rules | Supabase owns credentials and Postgres enforces tenant isolation and persisted integrity; Go owns application workflows and authoritative request validation. Cost: another deployable service to operate and secure. |
 | 4 | Client-generated UUIDs on expense create | Server-generated ids | Enables idempotent create now and an offline write queue later without a data migration. |
 | 5 | One currency per user and per period | Multi-currency with FX | All totals are trivially correct. The currency column already exists, so this is additive later. |
 | 6 | Integer minor units | `float` / `numeric` in JS | No cent-level drift, ever. Cost: every amount crosses the JS boundary as a number that must be formatted explicitly. |
 | 7 | Freeze computed split amounts; shared amount/splits immutable after create | Store the split rule, or allow in-place split edits | Historical balances never change meaning. Cost: changing a shared split means delete + recreate (FR-5.10). |
 | 8 | Equal + exact custom splits | Full Splitwise rule set | Validation is bounded (non-negative, must total exactly). Percentage and "N shares" are pure UI additions later. |
-| 9 | Balance and report math in SQL | Compute in TypeScript or Go | One implementation for the API, phone, and any future client. They cannot disagree. |
-| 10 | Server-side write RPCs (`SECURITY DEFINER`, locked `search_path`) | Client inserts plus RLS; DEFINER-free RPCs | Validation is atomic. Direct `INSERT` on splits is revoked. Cost: DEFINER functions must be reviewed; `search_path` must stay locked. |
+| 9 | Balance and report math in SQL | Compute in TypeScript or Go | One authoritative aggregate implementation; exact golden-dataset tests protect the results. |
+| 10 | Go-owned application workflows with database integrity safeguards | SQL-owned application workflows or client inserts | Go rules are readable and testable in the application language; RLS, constraints, and transactions remain the database enforcement boundary. Cost: both API behavior and database safeguards need focused security coverage. |
 | 11 | Soft-delete expenses, periods, and budgets; archive categories; tombstone on account delete | Hard delete everywhere, or soft-delete every table | Cached clients see a tombstone instead of a resurrection. Personal data is actually erased on account deletion; shared history is not (FR-1.7). |
 | 12 | Last-write-wins, no conflict engine | Optimistic locking / CRDTs | Simplicity. Accepted risk: two simultaneous edits to the same expense silently lose one. Manager-gated deletion keeps the blast radius small. |
 | 13 | Cached reads, online-only writes | Full offline-first sync | Avoids a sync protocol entirely. Accepted cost: you cannot record an expense with no signal. |
@@ -656,15 +657,16 @@ flowchart LR
 | 18 | Budgets are soft warnings | Hard blocks | Nobody abandons an app because a dinner wouldn't fit under a budget. |
 | 19 | One source of truth for server data | Mirroring into a local store | TanStack Query owns all server state; local stores hold only UI state. Prevents the classic duplicated-cache divergence bug. |
 | 20 | One mobile npm package and one Go module in a single repository | JavaScript workspaces or a multi-repository setup | Keeps mobile and API changes reviewable together without adding a workspace toolchain. |
-| 21 | Go application API in v1 | TypeScript/Node application API | A single stateless Go API provides the server boundary; Supabase Auth remains the identity provider, caller JWTs flow through to Postgres so RLS applies, and all data-shaped rules remain in SQL. |
+| 21 | Go application API in v1 | TypeScript/Node application API | A single stateless Go API owns application workflows and authoritative request validation; Supabase Auth remains the identity provider, caller identity flows to Postgres so RLS applies, and SQL owns integrity safeguards and aggregates. |
 
 ---
 
 ## 8. Testing strategy
 
-Confidence comes from SQL, not from the UI. The two things that can silently
-destroy this product are **tenant isolation** and **balance arithmetic** — both
-are database concerns.
+Confidence comes from testing each layer's responsibility. The two things that
+can silently destroy this product are **tenant isolation** and **balance
+arithmetic**; Postgres enforces RLS and computes aggregates, while Go owns
+application workflows and request rules.
 
 ### 8.1 Unit tests (Jest, `src/shared`)
 
@@ -690,7 +692,9 @@ same period, one outside it. Then assert:
 
 - A member can read the other member's expense in their shared period.
 - The outsider reads **zero** rows from that period.
-- A non-member cannot insert into a period they do not belong to.
+- The mobile `authenticated` role cannot write expenses or splits directly;
+  Go's restricted database role can insert only for a caller-visible owner or
+  period, under RLS.
 - A non-manager cannot update or delete another member's expense.
 - A member cannot read or write another user's categories or budgets.
 - Direct table access (not just through the app's queries) is blocked — this is
@@ -713,13 +717,14 @@ bugs produce wrong numbers, not exceptions.
 
 ### 8.3 Go API tests
 
-The Go test suite covers request handling, authentication, and the boundary to
-Supabase. It must assert that invalid, expired, wrong-issuer, and wrong-audience
-tokens are rejected; identity comes only from verified claims; user IDs supplied
-in request payloads cannot impersonate another account; and the validated user
-JWT is forwarded on PostgREST/RPC calls. API integration tests run against the
-local Supabase stack and prove that RLS still distinguishes a member from an
-outsider. Database policy tests also access tables directly through pgTAP.
+The Go test suite covers request handling, authentication, business validation,
+and the caller-scoped transaction wrapper. It must assert that invalid,
+expired, wrong-issuer, and wrong-audience tokens are rejected; identity comes
+only from verified claims; body-supplied IDs cannot impersonate another account;
+reads forward the caller JWT; and writes install only verified claims under
+`app_api`. API integration tests run against the local Supabase stack and prove
+that RLS still distinguishes a member from an outsider. Database policy tests
+also access tables directly through pgTAP.
 
 ### 8.4 What v1 skips
 
@@ -773,5 +778,7 @@ shared amount/splits are immutable after create; account deletion tombstones
 the profile; unverified sessions cannot write; v1 golden tests do not include
 mid-period joins; Android is the v1 installable gate; category archival (not
 hard-delete of referenced categories) is the v1 rule. v1 includes one Go
-application API; Supabase Auth remains the identity provider, user JWTs are
-forwarded for Postgres/RLS access, and data-shaped logic stays in Postgres.
+application API; Supabase Auth remains the identity provider, Go owns
+application workflows and request validation, caller identity is preserved for
+Postgres/RLS access, and Postgres owns persisted integrity and financial
+aggregates.

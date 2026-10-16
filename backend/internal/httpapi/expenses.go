@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/auth"
+	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/postgres"
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/supabase"
 )
 
@@ -133,8 +135,8 @@ type personalExpense struct {
 	CreatedAt   string  `json:"created_at"`
 }
 
-// requestError is a transport validation failure: the request never reaches
-// Supabase. The RPC re-validates everything authoritatively (BR-10).
+// requestError is a request-shape validation failure; application rules are
+// checked by the Go store before it writes the transaction.
 type requestError struct {
 	status  int
 	code    string
@@ -167,6 +169,9 @@ type expenseSplitInput struct {
 // create_expense SQL RPC under the caller's JWT. The author is always the
 // authenticated caller — the body carries no author field, so a
 // caller-supplied identity can never impersonate another account.
+// createExpense is the legacy PostgREST RPC adapter retained for the
+// compatibility router and pgTAP conformance period. Production startup uses
+// createExpenseWithPostgres through NewRouterWithPostgres.
 func createExpense(client *supabase.Client, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		session, ok := auth.SessionFromContext(r.Context())
@@ -242,6 +247,63 @@ func createExpense(client *supabase.Client, logger *slog.Logger) http.HandlerFun
 	}
 }
 
+func createExpenseWithPostgres(store *postgres.Store, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session, ok := auth.SessionFromContext(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "A valid access token is required.")
+			return
+		}
+		if r.Body == nil {
+			writeError(w, http.StatusBadRequest, "invalid_expense", "Request body is required.")
+			return
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, maxCreateExpenseBody+1))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_expense", "Request body could not be read.")
+			return
+		}
+		if len(raw) > maxCreateExpenseBody {
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body is too large.")
+			return
+		}
+		input, reqErr := parseCreateExpenseBody(raw)
+		if reqErr != nil {
+			writeError(w, reqErr.status, reqErr.code, reqErr.message)
+			return
+		}
+		storeInput := postgres.CreateExpenseInput{
+			ID: input.ID, PeriodID: input.PeriodID, CategoryID: input.CategoryID,
+			PaidBy: input.PaidBy, Amount: input.Amount, Currency: input.Currency,
+			OccurredOn: input.OccurredOn, Note: input.Note,
+			Splits: make([]postgres.Split, 0, len(input.Splits)),
+		}
+		for _, split := range input.Splits {
+			storeInput.Splits = append(storeInput.Splits, postgres.Split{UserID: split.UserID, Amount: split.Amount})
+		}
+		id, err := store.CreateExpense(r.Context(), session, storeInput)
+		switch {
+		case errors.Is(err, postgres.ErrInvalidExpense):
+			writeError(w, http.StatusBadRequest, "invalid_expense", err.Error())
+			return
+		case errors.Is(err, postgres.ErrForbidden):
+			writeError(w, http.StatusForbidden, "forbidden", "The request is not permitted.")
+			return
+		case errors.Is(err, postgres.ErrConflict):
+			writeError(w, http.StatusConflict, "expense_id_conflict", "An expense with this id already exists with different data.")
+			return
+		case err != nil:
+			logger.Error("PostgreSQL expense transaction failed", "error", err)
+			writeError(w, http.StatusServiceUnavailable, "data_provider_unavailable", "Expenses are temporarily unavailable.")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "private, no-store")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
+	}
+}
+
 // mapRPCError translates a PostgREST RPC failure into the API contract.
 // The pg error code drives the status; the RPC message is passed through so
 // clients can show it (e.g. "splits total … must match exactly"). RPC
@@ -285,14 +347,14 @@ type rpcExpenseSplit struct {
 }
 
 type rpcCreateExpense struct {
-	ID         string           `json:"p_id"`
-	PeriodID   *string          `json:"p_period_id"`
-	CategoryID *string          `json:"p_category_id"`
-	PaidBy     string           `json:"p_paid_by"`
-	Amount     int64            `json:"p_amount_minor"`
-	Currency   string           `json:"p_currency"`
-	OccurredOn string           `json:"p_occurred_on"`
-	Note       *string          `json:"p_note"`
+	ID         string            `json:"p_id"`
+	PeriodID   *string           `json:"p_period_id"`
+	CategoryID *string           `json:"p_category_id"`
+	PaidBy     string            `json:"p_paid_by"`
+	Amount     int64             `json:"p_amount_minor"`
+	Currency   string            `json:"p_currency"`
+	OccurredOn string            `json:"p_occurred_on"`
+	Note       *string           `json:"p_note"`
 	Splits     []rpcExpenseSplit `json:"p_splits"`
 }
 
@@ -308,10 +370,9 @@ func rpcCreateExpenseParams(input *createExpenseInput) rpcCreateExpense {
 	}
 }
 
-// parseCreateExpenseBody validates the transport shape of POST /v1/expenses.
+// parseCreateExpenseBody validates the JSON contract for POST /v1/expenses.
 // Unknown fields are rejected per the contract (additionalProperties: false).
-// The RPC re-checks every business rule; this only rejects malformed input
-// before a round trip.
+// Contextual application rules are validated by the Go Postgres store.
 func parseCreateExpenseBody(raw []byte) (*createExpenseInput, *requestError) {
 	invalid := func(message string) (*createExpenseInput, *requestError) {
 		return nil, &requestError{status: http.StatusBadRequest, code: "invalid_expense", message: message}
