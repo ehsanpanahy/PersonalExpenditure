@@ -1,0 +1,10 @@
+{
+  "$comment": "Canonical split-rounding cases (BR-2). Jest loads this file; the pgTAP golden dataset (supabase/tests/golden_dataset_test.sql §C) asserts the same values in SQL. Keep them in sync.",
+  "cases": [
+    { "name": "1000/3", "amountMinor": 1000, "n": 3, "expected": [334, 333, 333] },
+    { "name": "10/3", "amountMinor": 10, "n": 3, "expected": [4, 3, 3] },
+    { "name": "100/3", "amountMinor": 100, "n": 3, "expected": [34, 33, 33] },
+    { "name": "5/2", "amountMinor": 5, "n": 2, "expected": [3, 2] },
+    { "name": "1/1", "amountMinor": 1, "n": 1, "expected": [1] }
+  ]
+}

@@ -19,15 +19,24 @@ budgets, and reports remain in Postgres functions and views.
   expenses for an explicit inclusive date range. Optional pagination uses
   `limit` (default 50, max 100) and `offset` (max 10000). Shared expenses are
   excluded by the query and tenant visibility is enforced by RLS.
+- `POST /v1/expenses` records a personal (`period_id` null, owned
+  `category_id`, one owner split) or shared (`period_id` set, `category_id`
+  null, one positive split per participant) expense through the
+  `create_expense` SQL RPC under the caller's JWT. Amounts cross as decimal
+  strings; the RPC re-validates membership, dates, currency, and the exact
+  split-total invariant. Client-generated `id` values are idempotent (same
+  id + same payload returns the id with 201); a conflicting payload is 409.
 - Expense amounts are returned as decimal strings to preserve Postgres `bigint`
   precision in JavaScript clients.
 - `supabase/migrations/20261014000000_expense_read_schema.sql` creates the
   profile/category/period/expense tables and RLS policies needed for the read
-  path. Expense writes remain unavailable until the SQL RPCs are implemented.
+  path. `supabase/migrations/20261015000000_expense_writes.sql` adds the
+  `expense_splits` table, the `create_expense`/`update_expense`/
+  `soft_delete_expense` RPCs, and computed `period_balances`.
 - `openapi.yaml` is the API contract; generate mobile API types from it.
 
-This is the backend foundation plus the first read-only expense endpoint.
-Expense creation/edit/deletion, periods, budgets, reports, and exports remain
+This is the backend foundation plus personal expense reads and writes.
+Expense editing/deletion, periods, budgets, reports, and exports remain
 to be designed and implemented.
 
 ## Run locally

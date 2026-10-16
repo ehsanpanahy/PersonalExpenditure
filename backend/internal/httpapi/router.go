@@ -19,6 +19,7 @@ func NewRouter(verifier auth.Verifier, supabaseClient *supabase.Client, logger *
 	})
 	mux.Handle("GET /v1/me", requireAuth(verifier, logger)(http.HandlerFunc(meHandler)))
 	mux.Handle("GET /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(listPersonalExpenses(supabaseClient, logger))))
+	mux.Handle("POST /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(createExpense(supabaseClient, logger))))
 	return mux
 }
 

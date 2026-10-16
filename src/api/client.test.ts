@@ -97,4 +97,108 @@ describe('api client (Go API boundary)', () => {
       api.listPersonalExpenses({ from: '2026-03-01', to: '2026-03-31' }),
     ).rejects.toBeInstanceOf(ApiError);
   });
+
+  it('posts a personal expense with string amounts and the bearer token', async () => {
+    const seen: { url: string; auth: string; body: unknown }[] = [];
+    const fetchImpl = (async (url: unknown, init?: { headers?: Record<string, string>; body?: string }) => {
+      seen.push({
+        url: String(url),
+        auth: init?.headers?.['Authorization'] ?? '',
+        body: init?.body !== undefined ? (JSON.parse(init.body) as unknown) : undefined,
+      });
+      return jsonResponse({ id: '40000000-0000-0000-0000-000000000001' }, 201);
+    }) as unknown as typeof fetch;
+
+    const api = createApiClient({
+      baseUrl: 'http://localhost:8080',
+      getAccessToken: async () => 'test-token',
+      fetchImpl,
+    });
+    const result = await api.createExpense({
+      id: '40000000-0000-0000-0000-000000000001',
+      category_id: '20000000-0000-0000-0000-000000000001',
+      paid_by: '11111111-1111-1111-1111-111111111111',
+      amount_minor: '9007199254740993',
+      currency: 'USD',
+      occurred_on: '2026-03-14',
+      note: 'groceries',
+      splits: [{ user_id: '11111111-1111-1111-1111-111111111111', amount_minor: '9007199254740993' }],
+    });
+
+    expect(result).toEqual({ id: '40000000-0000-0000-0000-000000000001' });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.url).toBe('http://localhost:8080/v1/expenses');
+    expect(seen[0]?.auth).toBe('Bearer test-token');
+    // bigint crosses as an exact decimal string, never a lossy JSON number.
+    expect(seen[0]?.body).toMatchObject({
+      amount_minor: '9007199254740993',
+      currency: 'USD',
+      period_id: null,
+    });
+  });
+
+  it('rejects bad create payloads client-side without sending', async () => {
+    let called = false;
+    const fetchImpl = (async () => {
+      called = true;
+      return jsonResponse({ id: '40000000-0000-0000-0000-000000000001' }, 201);
+    }) as unknown as typeof fetch;
+    const api = createApiClient({
+      baseUrl: 'http://localhost:8080',
+      getAccessToken: async () => 'test-token',
+      fetchImpl,
+    });
+    const base = {
+      id: '40000000-0000-0000-0000-000000000001',
+      paid_by: '11111111-1111-1111-1111-111111111111',
+      amount_minor: '1250',
+      currency: 'USD',
+      occurred_on: '2026-03-14',
+      splits: [{ user_id: '11111111-1111-1111-1111-111111111111', amount_minor: '1250' }],
+    };
+    await expect(api.createExpense({ ...base, id: 'not-a-uuid' })).rejects.toThrow(RangeError);
+    await expect(
+      api.createExpense({ ...base, amount_minor: '12.50' }),
+    ).rejects.toThrow(RangeError);
+    await expect(
+      api.createExpense({
+        ...base,
+        amount_minor: '1000',
+        splits: [{ user_id: '11111111-1111-1111-1111-111111111111', amount_minor: '999' }],
+      }),
+    ).rejects.toThrow(/must match exactly/);
+    await expect(
+      api.createExpense({
+        ...base,
+        splits: [
+          { user_id: '11111111-1111-1111-1111-111111111111', amount_minor: '625' },
+          { user_id: '11111111-1111-1111-1111-111111111111', amount_minor: '625' },
+        ],
+      }),
+    ).rejects.toThrow(/must not repeat/);
+    expect(called).toBe(false);
+  });
+
+  it('surfaces server validation failures with their code', async () => {
+    const fetchImpl = (async () =>
+      jsonResponse({ error: { code: 'invalid_expense', message: 'splits total 999' } }, 400)) as unknown as typeof fetch;
+    const api = createApiClient({
+      baseUrl: 'http://localhost:8080',
+      getAccessToken: async () => 'test-token',
+      fetchImpl,
+    });
+    await expect(
+      api.createExpense({
+        id: '40000000-0000-0000-0000-000000000001',
+        paid_by: '11111111-1111-1111-1111-111111111111',
+        amount_minor: '1000',
+        currency: 'USD',
+        occurred_on: '2026-03-14',
+        splits: [
+          { user_id: '11111111-1111-1111-1111-111111111111', amount_minor: '500' },
+          { user_id: '22222222-2222-2222-2222-222222222222', amount_minor: '500' },
+        ],
+      }),
+    ).rejects.toMatchObject({ status: 400, code: 'invalid_expense' });
+  });
 });

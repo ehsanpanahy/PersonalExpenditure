@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: PersonalExpenditure API
-  version: 0.1.0
+  version: 0.2.0
   description: >-
     Go application API. Supabase Auth owns user credentials and sessions;
     authenticated requests use Supabase access tokens and Postgres RLS.
@@ -117,6 +117,68 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+    post:
+      operationId: createExpense
+      summary: Record a personal or shared expense
+      description: >-
+        Validates the request at the transport boundary, then calls the
+        `create_expense` SQL RPC under the caller's JWT. The RPC is
+        authoritative: membership, date ranges, currency, and the exact
+        split-total invariant are re-checked in Postgres and rejected, never
+        corrected. The expense author is always the authenticated caller;
+        `paid_by` and split members are validated as period members by the
+        RPC. The id is client-generated: retrying with the same id and
+        identical payload returns the same id (201); the same id with a
+        different payload is a 409 conflict.
+      security:
+        - supabaseBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExpenseRequest'
+      responses:
+        '201':
+          description: Expense recorded (or idempotent replay confirmed); returns the expense id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateExpenseResult'
+        '400':
+          description: Invalid expense payload, or the RPC rejected it (split total, dates, membership, currency)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/IdentityProviderUnavailable'
+        '403':
+          description: The caller may not record into this scope (not a member, period unavailable)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The client-generated id already exists with a different payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: Supabase data service failed or returned an invalid response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 components:
   securitySchemes:
     supabaseBearer:
@@ -149,6 +211,67 @@ components:
         created_at:
           type: string
           format: date-time
+    CreateExpenseSplit:
+      type: object
+      required: [user_id, amount_minor]
+      additionalProperties: false
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: Split participant; must be a member of the period for shared expenses.
+        amount_minor:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Frozen share in integer minor units, as a string to preserve bigint precision. Excluded members get no entry, never a zero share.
+    CreateExpenseRequest:
+      type: object
+      required: [id, paid_by, amount_minor, currency, occurred_on, splits]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Client-generated expense id for idempotent create and offline replay.
+        period_id:
+          type: [string, 'null']
+          format: uuid
+          description: Null for a personal expense; set for a shared expense in that period.
+        category_id:
+          type: [string, 'null']
+          format: uuid
+          description: Required for personal expenses (owned category); must be null for shared expenses.
+        paid_by:
+          type: string
+          format: uuid
+          description: Who fronted the money. Equals the caller for personal expenses; a period member for shared expenses.
+        amount_minor:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Expense total in integer minor units, as a string to preserve bigint precision. Must be greater than zero and fit in Postgres bigint.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        occurred_on:
+          type: string
+          format: date
+          description: Accounting date; must not be in the future (in the author's time zone) and must fall within the period for shared expenses.
+        note:
+          type: [string, 'null']
+        splits:
+          type: array
+          minItems: 1
+          maxItems: 200
+          description: Frozen shares. Exactly one entry (the caller, full amount) for personal expenses; one positive entry per participant for shared expenses. Entries must total exactly amount_minor.
+          items:
+            $ref: '#/components/schemas/CreateExpenseSplit'
+    CreateExpenseResult:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
     Error:
       type: object
       required: [error]
