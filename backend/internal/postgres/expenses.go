@@ -180,6 +180,44 @@ func (s *Store) CreateExpense(ctx context.Context, session auth.Session, in Crea
 	return in.ID, nil
 }
 
+// UpdatePersonalExpense edits only the caller's personal expense. The SQL
+// function repeats ownership, category ownership, date, and positive amount
+// checks under the same verified caller context.
+func (s *Store) UpdatePersonalExpense(ctx context.Context, session auth.Session, id string, amount int64, occurredOn string, categoryID string, note *string) error {
+	if !idPattern.MatchString(id) || !idPattern.MatchString(categoryID) || amount <= 0 {
+		return ErrInvalidExpense
+	}
+	if _, err := time.Parse("2006-01-02", occurredOn); err != nil {
+		return ErrInvalidExpense
+	}
+	tx, err := s.beginCallerTx(ctx, session)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `SELECT public.update_expense($1,$2,$3,$4,$5,true)`, id, amount, occurredOn, categoryID, note)
+	if err != nil {
+		return classifyWriteError(err)
+	}
+	return classifyWriteError(tx.Commit())
+}
+
+func (s *Store) SoftDeleteExpense(ctx context.Context, session auth.Session, id string) error {
+	if !idPattern.MatchString(id) {
+		return ErrInvalidExpense
+	}
+	tx, err := s.beginCallerTx(ctx, session)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `SELECT public.soft_delete_expense($1)`, id)
+	if err != nil {
+		return classifyWriteError(err)
+	}
+	return classifyWriteError(tx.Commit())
+}
+
 func validateShape(in CreateExpenseInput) error {
 	if !idPattern.MatchString(in.ID) || !idPattern.MatchString(in.PaidBy) || in.Amount <= 0 ||
 		len(in.Currency) != 3 || in.Currency != upper(in.Currency) || len(in.Splits) == 0 || len(in.Splits) > 200 {
@@ -297,6 +335,9 @@ func (s *Store) existingMatches(ctx context.Context, tx *sql.Tx, caller string, 
 }
 
 func classifyWriteError(err error) error {
+	if err == nil {
+		return nil
+	}
 	var state interface{ SQLState() string }
 	if errors.As(err, &state) {
 		switch state.SQLState() {

@@ -269,3 +269,190 @@ type postgresStateError struct{ state string }
 
 func (e *postgresStateError) Error() string    { return "postgres error " + e.state }
 func (e *postgresStateError) SQLState() string { return e.state }
+
+func expectCategoryCaller(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectExec("SET LOCAL ROLE app_api").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("SELECT set_config\\('request.jwt.claims'").WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("SELECT set_config\\('request.jwt.claim.sub'").WithArgs(testCallerID).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("SELECT set_config\\('request.jwt.claim.role'").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM public.profiles WHERE auth_user_id=$1 AND deleted_at IS NULL")).
+		WithArgs(testCallerID).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testCallerID))
+}
+
+func categoryResultRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id", "name", "icon", "color", "sort_order", "is_archived"}).
+		AddRow(testCategoryID, "Food", "fork", "blue", 3, false)
+}
+
+func TestCreateCategoryUsesVerifiedOwnerAndReturnsCategory(t *testing.T) {
+	store, mock := newMockStore(t)
+	expectCategoryCaller(mock)
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO public.categories (user_id, name, icon, color, sort_order)")).
+		WithArgs(testCallerID, "Food", "fork", "blue", 3).WillReturnRows(categoryResultRows())
+	mock.ExpectCommit()
+	category, err := store.CreateCategory(context.Background(), callerSession(), SaveCategoryInput{
+		Name: "Food", Icon: stringPtr("fork"), Color: stringPtr("blue"), SortOrder: 3,
+	})
+	if err != nil {
+		t.Fatalf("CreateCategory() error = %v", err)
+	}
+	if category.ID != testCategoryID || category.Name != "Food" || category.SortOrder != 3 || category.Archived {
+		t.Fatalf("CreateCategory() = %#v", category)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateCategoryScopesByVerifiedOwnerAndHidesForeignCategory(t *testing.T) {
+	t.Run("owned category updates", func(t *testing.T) {
+		store, mock := newMockStore(t)
+		expectCategoryCaller(mock)
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE public.categories SET name=$3, icon=$4, color=$5, sort_order=$6")).
+			WithArgs(testCategoryID, testCallerID, "Dining", nil, nil, 4).WillReturnRows(categoryResultRows())
+		mock.ExpectCommit()
+		if _, err := store.UpdateCategory(context.Background(), callerSession(), testCategoryID, SaveCategoryInput{Name: "Dining", SortOrder: 4}); err != nil {
+			t.Fatalf("UpdateCategory() error = %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("unavailable category", func(t *testing.T) {
+		store, mock := newMockStore(t)
+		expectCategoryCaller(mock)
+		mock.ExpectQuery(regexp.QuoteMeta("UPDATE public.categories SET name=$3, icon=$4, color=$5, sort_order=$6")).
+			WithArgs(testCategoryID, testCallerID, "Dining", nil, nil, 4).
+			WillReturnRows(sqlmock.NewRows([]string{"id", "name", "icon", "color", "sort_order", "is_archived"}))
+		mock.ExpectRollback()
+		_, err := store.UpdateCategory(context.Background(), callerSession(), testCategoryID, SaveCategoryInput{Name: "Dining", SortOrder: 4})
+		if !errors.Is(err, ErrCategoryUnavailable) {
+			t.Fatalf("error = %v, want unavailable", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestArchiveCategoryIsReversibleAndOwnerScoped(t *testing.T) {
+	for _, archived := range []bool{true, false} {
+		t.Run(map[bool]string{true: "archive", false: "restore"}[archived], func(t *testing.T) {
+			store, mock := newMockStore(t)
+			expectCategoryCaller(mock)
+			mock.ExpectExec(regexp.QuoteMeta("UPDATE public.categories SET is_archived=$3 WHERE id=$1 AND user_id=$2")).
+				WithArgs(testCategoryID, testCallerID, archived).WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectCommit()
+			if err := store.ArchiveCategory(context.Background(), callerSession(), testCategoryID, archived); err != nil {
+				t.Fatal(err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestCategoryInputValidationAndPostgresConflictMapping(t *testing.T) {
+	for _, in := range []SaveCategoryInput{{Name: "", SortOrder: 0}, {Name: " padded ", SortOrder: 0}, {Name: "valid", SortOrder: -1}, {Name: "valid", SortOrder: 100001}} {
+		if err := ValidateCategoryInput(in); !errors.Is(err, ErrInvalidCategory) {
+			t.Errorf("ValidateCategoryInput(%#v) = %v, want invalid", in, err)
+		}
+	}
+	if err := ValidateCategoryInput(SaveCategoryInput{Name: "valid", SortOrder: 100000}); err != nil {
+		t.Fatalf("valid boundary rejected: %v", err)
+	}
+	if got := classifyCategoryError(&postgresStateError{state: "23505"}); !errors.Is(got, ErrCategoryConflict) {
+		t.Fatalf("duplicate mapping = %v", got)
+	}
+}
+
+func TestUpdatePersonalExpenseCallsTransactionalDatabaseWorkflow(t *testing.T) {
+	store, mock := newMockStore(t)
+	expectMutationCallerContext(mock)
+	mock.ExpectExec(regexp.QuoteMeta("SELECT public.update_expense($1,$2,$3,$4,$5,true)")).
+		WithArgs(testExpenseID, int64(987), "2026-03-14", testCategoryID, "revised note").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	note := "revised note"
+	if err := store.UpdatePersonalExpense(context.Background(), callerSession(), testExpenseID, 987, "2026-03-14", testCategoryID, &note); err != nil {
+		t.Fatalf("UpdatePersonalExpense() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdatePersonalExpenseRejectsInvalidInputBeforeDatabaseAccess(t *testing.T) {
+	cases := []struct {
+		name, id, category, date string
+		amount                   int64
+	}{
+		{"bad expense id", "bad", testCategoryID, "2026-03-14", 1},
+		{"bad category id", testExpenseID, "bad", "2026-03-14", 1},
+		{"zero amount", testExpenseID, testCategoryID, "2026-03-14", 0},
+		{"negative amount", testExpenseID, testCategoryID, "2026-03-14", -5},
+		{"invalid date", testExpenseID, testCategoryID, "2026-02-30", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, mock := newMockStore(t)
+			if err := store.UpdatePersonalExpense(context.Background(), callerSession(), tc.id, tc.amount, tc.date, tc.category, nil); !errors.Is(err, ErrInvalidExpense) {
+				t.Fatalf("error = %v, want ErrInvalidExpense", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSoftDeleteExpenseCallsSoftDeleteFunctionAndCommits(t *testing.T) {
+	store, mock := newMockStore(t)
+	expectMutationCallerContext(mock)
+	mock.ExpectExec(regexp.QuoteMeta("SELECT public.soft_delete_expense($1)")).WithArgs(testExpenseID).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	if err := store.SoftDeleteExpense(context.Background(), callerSession(), testExpenseID); err != nil {
+		t.Fatalf("SoftDeleteExpense() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPersonalExpenseMutationsMapDatabaseAuthorizationFailures(t *testing.T) {
+	t.Run("update", func(t *testing.T) {
+		store, mock := newMockStore(t)
+		expectMutationCallerContext(mock)
+		mock.ExpectExec(regexp.QuoteMeta("SELECT public.update_expense($1,$2,$3,$4,$5,true)")).WithArgs(testExpenseID, int64(1), "2026-03-14", testCategoryID, nil).WillReturnError(&postgresStateError{state: "42501"})
+		mock.ExpectRollback()
+		if err := store.UpdatePersonalExpense(context.Background(), callerSession(), testExpenseID, 1, "2026-03-14", testCategoryID, nil); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("error = %v, want ErrForbidden", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("delete", func(t *testing.T) {
+		store, mock := newMockStore(t)
+		expectMutationCallerContext(mock)
+		mock.ExpectExec(regexp.QuoteMeta("SELECT public.soft_delete_expense($1)")).WithArgs(testExpenseID).WillReturnError(&postgresStateError{state: "42501"})
+		mock.ExpectRollback()
+		if err := store.SoftDeleteExpense(context.Background(), callerSession(), testExpenseID); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("error = %v, want ErrForbidden", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func expectMutationCallerContext(mock sqlmock.Sqlmock) {
+	mock.ExpectBegin()
+	mock.ExpectExec("SET LOCAL ROLE app_api").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("SELECT set_config\\('request.jwt.claims'").WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("SELECT set_config\\('request.jwt.claim.sub'").WithArgs(testCallerID).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("SELECT set_config\\('request.jwt.claim.role'").WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func stringPtr(value string) *string { return &value }

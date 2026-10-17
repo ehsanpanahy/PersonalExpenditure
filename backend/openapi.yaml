@@ -179,6 +179,139 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /v1/expenses/{id}:
+    put:
+      operationId: updatePersonalExpense
+      summary: Update a personal expense
+      security:
+        - supabaseBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [amount_minor, occurred_on, category_id, note]
+              properties:
+                amount_minor: { type: string, pattern: '^[0-9]+$' }
+                occurred_on: { type: string, format: date }
+                category_id: { type: string, format: uuid }
+                note: { type: [string, 'null'], maxLength: 2000 }
+      responses:
+        '204': { description: Expense updated }
+        '400': { description: Invalid values }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Expense is not available to this account }
+        '404': { description: Expense is not available }
+        '502': { description: Data service unavailable }
+    delete:
+      operationId: softDeleteExpense
+      summary: Soft-delete a personal expense
+      security:
+        - supabaseBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Expense hidden from lists and totals }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Expense is not available to this account }
+        '502': { description: Data service unavailable }
+  /v1/categories:
+    get:
+      operationId: listCategories
+      summary: List the caller's categories, including archived categories
+      security:
+        - supabaseBearer: []
+      responses:
+        '200':
+          description: Categories owned by the verified caller
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Category' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '502': { description: Data service unavailable }
+    post:
+      operationId: createCategory
+      summary: Create a private category
+      security:
+        - supabaseBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveCategoryRequest' }
+      responses:
+        '201':
+          description: Category created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        '400': { description: Invalid category }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: Category name already exists }
+  /v1/categories/{id}:
+    put:
+      operationId: updateCategory
+      summary: Rename, recolor, or reorder a category
+      security:
+        - supabaseBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SaveCategoryRequest' }
+      responses:
+        '200':
+          description: Updated category
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        '400': { description: Invalid category }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Category unavailable }
+        '409': { description: Category name already exists }
+  /v1/categories/{id}/archive:
+    patch:
+      operationId: setCategoryArchived
+      summary: Archive or restore a category without deleting its history
+      security:
+        - supabaseBearer: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [is_archived]
+              properties:
+                is_archived: { type: boolean }
+      responses:
+        '204': { description: Archive state updated }
+        '400': { description: Invalid archive state }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Category unavailable }
 components:
   securitySchemes:
     supabaseBearer:
@@ -211,6 +344,25 @@ components:
         created_at:
           type: string
           format: date-time
+    Category:
+      type: object
+      required: [id, name, sort_order, is_archived]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        icon: { type: [string, 'null'] }
+        color: { type: [string, 'null'] }
+        sort_order: { type: integer, minimum: 0 }
+        is_archived: { type: boolean }
+    SaveCategoryRequest:
+      type: object
+      additionalProperties: false
+      required: [name, sort_order]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        icon: { type: [string, 'null'], maxLength: 64 }
+        color: { type: [string, 'null'], maxLength: 64 }
+        sort_order: { type: integer, minimum: 0, maximum: 100000 }
     CreateExpenseSplit:
       type: object
       required: [user_id, amount_minor]

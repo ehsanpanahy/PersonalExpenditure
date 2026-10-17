@@ -304,6 +304,74 @@ func createExpenseWithPostgres(store *postgres.Store, logger *slog.Logger) http.
 	}
 }
 
+func updatePersonalExpense(store *postgres.Store, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session, ok := auth.SessionFromContext(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "A valid access token is required.")
+			return
+		}
+		var body struct {
+			Amount     *string         `json:"amount_minor"`
+			OccurredOn *string         `json:"occurred_on"`
+			CategoryID *string         `json:"category_id"`
+			Note       json.RawMessage `json:"note"`
+		}
+		if err := decodeStrictJSON(r, &body); err != nil || body.Amount == nil || body.OccurredOn == nil || body.CategoryID == nil || body.Note == nil {
+			writeError(w, http.StatusBadRequest, "invalid_expense", "amount_minor, occurred_on, category_id, and note are required.")
+			return
+		}
+		amount, err := parsePositiveBigint(*body.Amount)
+		if err != nil || !uuidPattern.MatchString(*body.CategoryID) || !isValidDate(*body.OccurredOn) {
+			writeError(w, http.StatusBadRequest, "invalid_expense", "Expense values are invalid.")
+			return
+		}
+		var note *string
+		if string(body.Note) != "null" {
+			var value string
+			if err := json.Unmarshal(body.Note, &value); err != nil || len(value) > 2000 {
+				writeError(w, http.StatusBadRequest, "invalid_expense", "note must be a string or null, up to 2000 characters.")
+				return
+			}
+			note = &value
+		}
+		if err := store.UpdatePersonalExpense(r.Context(), session, r.PathValue("id"), amount, *body.OccurredOn, *body.CategoryID, note); err != nil {
+			writeExpenseStoreError(w, err, logger)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func softDeleteExpense(store *postgres.Store, logger *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session, ok := auth.SessionFromContext(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "A valid access token is required.")
+			return
+		}
+		if err := store.SoftDeleteExpense(r.Context(), session, r.PathValue("id")); err != nil {
+			writeExpenseStoreError(w, err, logger)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func writeExpenseStoreError(w http.ResponseWriter, err error, logger *slog.Logger) {
+	switch {
+	case errors.Is(err, postgres.ErrInvalidExpense):
+		writeError(w, http.StatusBadRequest, "invalid_expense", err.Error())
+	case errors.Is(err, postgres.ErrForbidden):
+		writeError(w, http.StatusForbidden, "forbidden", "The expense is not available to this account.")
+	case errors.Is(err, postgres.ErrConflict):
+		writeError(w, http.StatusConflict, "expense_conflict", "The expense could not be updated because it changed.")
+	default:
+		logger.Error("expense mutation failed", "error", err)
+		writeError(w, http.StatusBadGateway, "data_provider_error", "Expenses are temporarily unavailable.")
+	}
+}
+
 // mapRPCError translates a PostgREST RPC failure into the API contract.
 // The pg error code drives the status; the RPC message is passed through so
 // clients can show it (e.g. "splits total … must match exactly"). RPC

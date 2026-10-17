@@ -33,6 +33,14 @@ func newRouter(verifier auth.Verifier, supabaseClient *supabase.Client, store *p
 		createHandler = createExpenseWithPostgres(store, logger)
 	}
 	mux.Handle("POST /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(createHandler)))
+	if store != nil {
+		mux.Handle("PUT /v1/expenses/{id}", requireAuth(verifier, logger)(http.HandlerFunc(updatePersonalExpense(store, logger))))
+		mux.Handle("DELETE /v1/expenses/{id}", requireAuth(verifier, logger)(http.HandlerFunc(softDeleteExpense(store, logger))))
+		mux.Handle("GET /v1/categories", requireAuth(verifier, logger)(http.HandlerFunc(listCategories(store, logger))))
+		mux.Handle("POST /v1/categories", requireAuth(verifier, logger)(http.HandlerFunc(createCategory(store, logger))))
+		mux.Handle("PUT /v1/categories/{id}", requireAuth(verifier, logger)(http.HandlerFunc(updateCategory(store, logger))))
+		mux.Handle("PATCH /v1/categories/{id}/archive", requireAuth(verifier, logger)(http.HandlerFunc(setCategoryArchived(store, logger))))
+	}
 	return mux
 }
 

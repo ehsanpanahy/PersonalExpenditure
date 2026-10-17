@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/auth"
+	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/postgres"
 	"github.com/ehsanpanahy/PersonalExpenditure/backend/internal/supabase"
 )
 
@@ -189,3 +191,58 @@ func TestParseExpenseListQueryBoundsPagination(t *testing.T) {
 }
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestDecodeCategoryTrimsNameAndRequiresStrictValidPayload(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/v1/categories", strings.NewReader(`{"name":"  Food  ","sort_order":2,"icon":"fork","color":"blue"}`))
+	input, err := decodeCategory(r)
+	if err != nil {
+		t.Fatalf("decodeCategory() error = %v", err)
+	}
+	if input.Name != "Food" || input.SortOrder != 2 || input.Icon == nil || *input.Icon != "fork" {
+		t.Fatalf("decoded input = %#v", input)
+	}
+	for _, body := range []string{
+		`{"name":"Food"}`,
+		`{"name":"Food","sort_order":-1}`,
+		`{"name":"Food","sort_order":0,"user_id":"attacker"}`,
+		`{"name":"Food","sort_order":0} {"name":"other"}`,
+		`{"name":"   ","sort_order":0}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			if _, err := decodeCategory(httptest.NewRequest(http.MethodPost, "/v1/categories", strings.NewReader(body))); err == nil {
+				t.Fatalf("decodeCategory(%s) unexpectedly succeeded", body)
+			}
+		})
+	}
+}
+
+func TestCategoryHandlersRejectUnauthenticatedRequestsBeforeStore(t *testing.T) {
+	logger := quietLogger()
+	response := httptest.NewRecorder()
+	listCategories(nil, logger)(response, httptest.NewRequest(http.MethodGet, "/v1/categories", nil))
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("list status = %d, want 401", response.Code)
+	}
+	response = httptest.NewRecorder()
+	createCategory(nil, logger)(response, httptest.NewRequest(http.MethodPost, "/v1/categories", strings.NewReader(`{"name":"Food","sort_order":0,"owner":"forged"}`)))
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("create status = %d, want 401", response.Code)
+	}
+}
+
+func TestWriteCategoryErrorMapsConflictAndMissingCategory(t *testing.T) {
+	for _, test := range []struct {
+		err    error
+		code   string
+		status int
+	}{
+		{postgres.ErrCategoryConflict, "category_name_conflict", http.StatusConflict},
+		{postgres.ErrCategoryUnavailable, "category_not_found", http.StatusNotFound},
+	} {
+		response := httptest.NewRecorder()
+		writeCategoryError(response, test.err, quietLogger())
+		if response.Code != test.status || !strings.Contains(response.Body.String(), test.code) {
+			t.Errorf("response = %d %q, want %d with %q", response.Code, response.Body.String(), test.status, test.code)
+		}
+	}
+}
