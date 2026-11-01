@@ -1,7 +1,7 @@
--- Go owns expense-create workflows. This migration grants its restricted role
--- the minimum write path while keeping Postgres RLS and an exact split-sum
--- constraint as integrity safeguards. The mobile-facing authenticated role
--- remains read-only for expenses and splits.
+-- Go owns expense workflows and request validation. This migration grants its
+-- restricted role the minimum write path while keeping Postgres RLS and exact
+-- split-sum integrity safeguards. The mobile-facing authenticated role remains
+-- read-only for expenses and splits.
 
 CREATE ROLE app_api NOLOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 GRANT authenticated TO app_api;
@@ -20,6 +20,9 @@ GRANT INSERT (id, user_id, period_id, category_id, paid_by, amount_minor,
     currency, occurred_on, note) ON public.expenses TO app_api;
 GRANT INSERT (expense_id, user_id, amount_minor)
     ON public.expense_splits TO app_api;
+GRANT UPDATE (amount_minor, occurred_on, category_id, note, updated_at, deleted_at)
+    ON public.expenses TO app_api;
+GRANT UPDATE (amount_minor) ON public.expense_splits TO app_api;
 
 CREATE POLICY expenses_insert_via_go_api ON public.expenses
     FOR INSERT TO app_api
@@ -35,6 +38,18 @@ CREATE POLICY expenses_insert_via_go_api ON public.expenses
         OR (period_id IS NOT NULL AND public.is_live_period_member(period_id))
     );
 
+CREATE POLICY expenses_update_personal_via_go_api ON public.expenses
+    FOR UPDATE TO app_api
+    USING (
+        period_id IS NULL
+        AND user_id = public.caller_profile_id()
+        AND deleted_at IS NULL
+    )
+    WITH CHECK (
+        period_id IS NULL
+        AND user_id = public.caller_profile_id()
+    );
+
 CREATE POLICY expense_splits_insert_via_go_api ON public.expense_splits
     FOR INSERT TO app_api
     WITH CHECK (
@@ -48,6 +63,22 @@ CREATE POLICY expense_splits_insert_via_go_api ON public.expense_splits
               )
         )
     );
+
+CREATE POLICY expense_splits_update_personal_via_go_api ON public.expense_splits
+    FOR UPDATE TO app_api
+    USING (EXISTS (
+        SELECT 1 FROM public.expenses AS expense
+        WHERE expense.id = expense_splits.expense_id
+          AND expense.period_id IS NULL
+          AND expense.user_id = public.caller_profile_id()
+          AND expense.deleted_at IS NULL
+    ))
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM public.expenses AS expense
+        WHERE expense.id = expense_splits.expense_id
+          AND expense.period_id IS NULL
+          AND expense.user_id = public.caller_profile_id()
+    ));
 
 -- A split set is valid only as a whole. Deferred triggers see the final
 -- transaction state, allowing Go to insert the expense and all shares in one
@@ -95,28 +126,10 @@ CREATE CONSTRAINT TRIGGER expenses_split_total_check
     FOR EACH ROW EXECUTE FUNCTION public.assert_expense_split_total();
 
 CREATE CONSTRAINT TRIGGER expense_splits_total_check
-    AFTER INSERT ON public.expense_splits
+    AFTER INSERT OR UPDATE OF amount_minor ON public.expense_splits
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION public.assert_expense_split_total();
 
 REVOKE ALL ON FUNCTION public.assert_expense_split_total() FROM PUBLIC;
 
--- Keep the old SECURITY DEFINER functions available only to the restricted
--- server role while the pgTAP suite still uses them as a SQL conformance
--- harness. The mobile authenticated role cannot invoke these alternate write
--- workflows; production HTTP writes use Go's transaction implementation.
-REVOKE ALL ON FUNCTION public.create_expense(uuid, uuid, uuid, uuid, bigint, char(3), date, text, jsonb)
-    FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.create_expense(uuid, uuid, uuid, uuid, bigint, char(3), date, text, jsonb)
-    TO app_api;
-REVOKE ALL ON FUNCTION public.update_expense(uuid, bigint, date, uuid, text, boolean)
-    FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.update_expense(uuid, bigint, date, uuid, text, boolean)
-    TO app_api;
-REVOKE ALL ON FUNCTION public.soft_delete_expense(uuid)
-    FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.soft_delete_expense(uuid) TO app_api;
-
 REVOKE ALL ON FUNCTION public.caller_profile_id() FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.is_live_member_of(uuid, uuid) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.is_live_period_manager(uuid) FROM PUBLIC, anon, authenticated;

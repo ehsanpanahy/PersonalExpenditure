@@ -291,7 +291,7 @@ never depends on the device behaving well.
 | NFR-6 | The app holds no payment card details and requests no banking credentials, ever. |
 | NFR-7 | Financial calculations are covered by automated tests with known-good expected values, not merely "no errors". |
 | NFR-8 | Every database change ships as a versioned migration that is verified in continuous integration before release. |
-| NFR-9 | The v1 application data API is implemented in Go. It validates Supabase Auth user tokens and derives identity only from the verified Auth response. Reads forward the caller's JWT so Row Level Security applies. Go-owned writes use caller claims in a restricted Postgres role and remain subject to RLS. Service-role credentials are never exposed to the mobile app or used for user-scoped requests. |
+| NFR-9 | The v1 application data API is implemented in Go. Go validates Supabase Auth user tokens, derives identity only from the verified Auth response, and performs all authoritative request validation and application workflows. Reads forward the caller's JWT so Row Level Security applies. Writes use caller claims in a restricted Postgres role and remain subject to RLS. Postgres functions support RLS, narrow protected-data lookups, and aggregates; constraints and triggers enforce persisted integrity. SQL functions must not provide alternate application workflows or duplicate Go request validation. Service-role credentials are never exposed to the mobile app or used for user-scoped requests. |
 
 ---
 

@@ -2,7 +2,10 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
+	"os"
 	"regexp"
 	"testing"
 	"time"
@@ -133,6 +136,49 @@ func TestCreateExpenseWritesSharedExpenseForPeriodMembers(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGoValidationAcceptsCanonicalFrozenSplitCases(t *testing.T) {
+	type splitCase struct {
+		Name        string  `json:"name"`
+		AmountMinor int64   `json:"amountMinor"`
+		N           int     `json:"n"`
+		Expected    []int64 `json:"expected"`
+	}
+	var fixture struct {
+		Cases []splitCase `json:"cases"`
+	}
+	data, err := os.ReadFile("../../../src/shared/splits/conformance.json")
+	if err != nil {
+		t.Fatalf("read canonical split fixture: %v", err)
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatalf("decode canonical split fixture: %v", err)
+	}
+	memberIDs := []string{
+		"11111111-1111-1111-1111-111111111111",
+		"22222222-2222-2222-2222-222222222222",
+		"33333333-3333-3333-3333-333333333333",
+	}
+	for _, tc := range fixture.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			if tc.N < 1 || tc.N > len(memberIDs) || len(tc.Expected) != tc.N {
+				t.Fatalf("invalid conformance case: n=%d expected=%v", tc.N, tc.Expected)
+			}
+			periodID := testPeriodID
+			in := CreateExpenseInput{
+				ID: testExpenseID, PeriodID: &periodID, PaidBy: memberIDs[0],
+				Amount: tc.AmountMinor, Currency: "USD", OccurredOn: "2026-03-14",
+				Splits: make([]Split, tc.N),
+			}
+			for i := 0; i < tc.N; i++ {
+				in.Splits[i] = Split{UserID: memberIDs[i], Amount: tc.Expected[i]}
+			}
+			if err := validateShape(in); err != nil {
+				t.Fatalf("Go rejected canonical frozen shares %v: %v", tc.Expected, err)
+			}
+		})
 	}
 }
 
@@ -368,11 +414,19 @@ func TestCategoryInputValidationAndPostgresConflictMapping(t *testing.T) {
 	}
 }
 
-func TestUpdatePersonalExpenseCallsTransactionalDatabaseWorkflow(t *testing.T) {
+func TestUpdatePersonalExpenseUsesCallerScopedDirectWrites(t *testing.T) {
 	store, mock := newMockStore(t)
 	expectMutationCallerContext(mock)
-	mock.ExpectExec(regexp.QuoteMeta("SELECT public.update_expense($1,$2,$3,$4,$5,true)")).
-		WithArgs(testExpenseID, int64(987), "2026-03-14", testCategoryID, "revised note").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, timezone FROM public.profiles WHERE auth_user_id=$1 AND deleted_at IS NULL")).
+		WithArgs(testCallerID).WillReturnRows(sqlmock.NewRows([]string{"id", "timezone"}).AddRow(testCallerID, "UTC"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS(SELECT 1 FROM public.categories WHERE id=$1 AND user_id=$2)")).
+		WithArgs(testCategoryID, testCallerID).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM public.expenses WHERE id=$1 AND user_id=$2 AND period_id IS NULL AND deleted_at IS NULL FOR UPDATE")).
+		WithArgs(testExpenseID, testCallerID).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testExpenseID))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE public.expenses SET amount_minor=$2, occurred_on=$3, category_id=$4, note=$5, updated_at=now() WHERE id=$1")).
+		WithArgs(testExpenseID, int64(987), sqlmock.AnyArg(), testCategoryID, "revised note").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE public.expense_splits SET amount_minor=$3 WHERE expense_id=$1 AND user_id=$2")).
+		WithArgs(testExpenseID, testCallerID, int64(987)).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	note := "revised note"
 	if err := store.UpdatePersonalExpense(context.Background(), callerSession(), testExpenseID, 987, "2026-03-14", testCategoryID, &note); err != nil {
@@ -407,10 +461,13 @@ func TestUpdatePersonalExpenseRejectsInvalidInputBeforeDatabaseAccess(t *testing
 	}
 }
 
-func TestSoftDeleteExpenseCallsSoftDeleteFunctionAndCommits(t *testing.T) {
+func TestSoftDeleteExpenseUsesCallerScopedUpdateAndCommits(t *testing.T) {
 	store, mock := newMockStore(t)
 	expectMutationCallerContext(mock)
-	mock.ExpectExec(regexp.QuoteMeta("SELECT public.soft_delete_expense($1)")).WithArgs(testExpenseID).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM public.profiles WHERE auth_user_id=$1 AND deleted_at IS NULL")).
+		WithArgs(testCallerID).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testCallerID))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE public.expenses SET deleted_at=now(), updated_at=now() WHERE id=$1 AND user_id=$2 AND period_id IS NULL AND deleted_at IS NULL")).
+		WithArgs(testExpenseID, testCallerID).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 	if err := store.SoftDeleteExpense(context.Background(), callerSession(), testExpenseID); err != nil {
 		t.Fatalf("SoftDeleteExpense() error = %v", err)
@@ -424,7 +481,12 @@ func TestPersonalExpenseMutationsMapDatabaseAuthorizationFailures(t *testing.T) 
 	t.Run("update", func(t *testing.T) {
 		store, mock := newMockStore(t)
 		expectMutationCallerContext(mock)
-		mock.ExpectExec(regexp.QuoteMeta("SELECT public.update_expense($1,$2,$3,$4,$5,true)")).WithArgs(testExpenseID, int64(1), "2026-03-14", testCategoryID, nil).WillReturnError(&postgresStateError{state: "42501"})
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id, timezone FROM public.profiles WHERE auth_user_id=$1 AND deleted_at IS NULL")).
+			WithArgs(testCallerID).WillReturnRows(sqlmock.NewRows([]string{"id", "timezone"}).AddRow(testCallerID, "UTC"))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS(SELECT 1 FROM public.categories WHERE id=$1 AND user_id=$2)")).
+			WithArgs(testCategoryID, testCallerID).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM public.expenses WHERE id=$1 AND user_id=$2 AND period_id IS NULL AND deleted_at IS NULL FOR UPDATE")).
+			WithArgs(testExpenseID, testCallerID).WillReturnError(sql.ErrNoRows)
 		mock.ExpectRollback()
 		if err := store.UpdatePersonalExpense(context.Background(), callerSession(), testExpenseID, 1, "2026-03-14", testCategoryID, nil); !errors.Is(err, ErrForbidden) {
 			t.Fatalf("error = %v, want ErrForbidden", err)
@@ -436,7 +498,10 @@ func TestPersonalExpenseMutationsMapDatabaseAuthorizationFailures(t *testing.T) 
 	t.Run("delete", func(t *testing.T) {
 		store, mock := newMockStore(t)
 		expectMutationCallerContext(mock)
-		mock.ExpectExec(regexp.QuoteMeta("SELECT public.soft_delete_expense($1)")).WithArgs(testExpenseID).WillReturnError(&postgresStateError{state: "42501"})
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM public.profiles WHERE auth_user_id=$1 AND deleted_at IS NULL")).
+			WithArgs(testCallerID).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(testCallerID))
+		mock.ExpectExec(regexp.QuoteMeta("UPDATE public.expenses SET deleted_at=now(), updated_at=now() WHERE id=$1 AND user_id=$2 AND period_id IS NULL AND deleted_at IS NULL")).
+			WithArgs(testExpenseID, testCallerID).WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectRollback()
 		if err := store.SoftDeleteExpense(context.Background(), callerSession(), testExpenseID); !errors.Is(err, ErrForbidden) {
 			t.Fatalf("error = %v, want ErrForbidden", err)

@@ -99,9 +99,10 @@ that are **silent** — wrong numbers, or leaked data — rather than crashes.
   only from Supabase Auth's verified response, ignore body-supplied identity
   for authorization, and confirm reads forward the JWT and writes install only
   verified claims under the restricted role so RLS applies.
-- **Split-rounding conformance** — the rounding rule exists in both SQL and
-  TypeScript. A shared fixture set must drive assertions in both the Jest and
-  pgTAP suites so they cannot drift.
+- **Split-rounding conformance** — TypeScript computes the instant preview and
+  Go validates submitted frozen shares and their exact total. A shared fixture
+  set drives Jest and Go validation assertions. Postgres only enforces the
+  persisted split-total invariant; it does not implement the rounding rule.
 
 Must-cover cases: an amount that does not divide evenly, a one-cent expense, a
 member who joined partway through, a custom exact split, a soft-deleted
@@ -133,9 +134,10 @@ never be committed or pasted into a commit message, issue, or log.
 Do not implement these without an explicit answer — they are genuinely
 unsettled, not merely undocumented:
 
-- **Split-rounding duplication.** The rounding rule lives in SQL (authoritative)
-  and TypeScript (optimistic preview). Whether to keep both with a conformance
-  test, or drop the TypeScript copy and preview from the server, is undecided.
+- **Split-rounding ownership.** TypeScript currently computes the instant
+  preview; Go validates the submitted frozen values. Whether Go should also
+  compute equal-share rounding or the preview should remain client-only is
+  undecided. Do not add a SQL rounding implementation.
 - Refunds / negative amounts, period-member removal, and the "Period" product
   name. See `docs/REQUIREMENTS.md` §9 and `docs/ARCHITECTURE.md` §9.
 

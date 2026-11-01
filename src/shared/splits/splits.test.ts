@@ -2,7 +2,7 @@ import { allocate } from '../money/allocate';
 import { freezeShares, validateExactShares } from './index';
 import conformance from './conformance.json';
 
-describe('split-rounding conformance (BR-2, mirrors pgTAP §C)', () => {
+describe('split-rounding conformance (BR-2, shared with Go validation tests)', () => {
   for (const c of (
     conformance as {
       cases: { name: string; amountMinor: number; n: number; expected: number[] }[];
@@ -35,7 +35,7 @@ describe('split-rounding conformance (BR-2, mirrors pgTAP §C)', () => {
   });
 });
 
-describe('validateExactShares (FR-5.6/5.7, UX mirror of create_expense)', () => {
+describe('validateExactShares (FR-5.6/5.7, UX mirror of Go validation)', () => {
   it('accepts the canonical 1000/3 frozen split', () => {
     expect(
       validateExactShares(1000, [

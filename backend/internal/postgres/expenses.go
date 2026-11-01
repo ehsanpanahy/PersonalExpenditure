@@ -180,14 +180,14 @@ func (s *Store) CreateExpense(ctx context.Context, session auth.Session, in Crea
 	return in.ID, nil
 }
 
-// UpdatePersonalExpense edits only the caller's personal expense. The SQL
-// function repeats ownership, category ownership, date, and positive amount
-// checks under the same verified caller context.
+// UpdatePersonalExpense edits only the caller's personal expense. Go performs
+// the authoritative checks; RLS and the deferred split trigger protect writes.
 func (s *Store) UpdatePersonalExpense(ctx context.Context, session auth.Session, id string, amount int64, occurredOn string, categoryID string, note *string) error {
 	if !idPattern.MatchString(id) || !idPattern.MatchString(categoryID) || amount <= 0 {
 		return ErrInvalidExpense
 	}
-	if _, err := time.Parse("2006-01-02", occurredOn); err != nil {
+	date, err := time.Parse("2006-01-02", occurredOn)
+	if err != nil || date.Format("2006-01-02") != occurredOn {
 		return ErrInvalidExpense
 	}
 	tx, err := s.beginCallerTx(ctx, session)
@@ -195,8 +195,40 @@ func (s *Store) UpdatePersonalExpense(ctx context.Context, session auth.Session,
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `SELECT public.update_expense($1,$2,$3,$4,$5,true)`, id, amount, occurredOn, categoryID, note)
+	var profileID, timezone string
+	err = tx.QueryRowContext(ctx, `SELECT id, timezone FROM public.profiles WHERE auth_user_id=$1 AND deleted_at IS NULL`, session.Principal.UserID).Scan(&profileID, &timezone)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrForbidden
+	}
 	if err != nil {
+		return fmt.Errorf("load caller profile for expense update: %w", err)
+	}
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		return fmt.Errorf("profile has invalid timezone: %w", err)
+	}
+	if occurredOn > time.Now().In(location).Format("2006-01-02") {
+		return fmt.Errorf("%w: occurred_on cannot be in the future", ErrInvalidExpense)
+	}
+	var exists bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM public.categories WHERE id=$1 AND user_id=$2)`, categoryID, profileID).Scan(&exists); err != nil {
+		return fmt.Errorf("check expense category: %w", err)
+	}
+	if !exists {
+		return ErrForbidden
+	}
+	var lockedID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM public.expenses WHERE id=$1 AND user_id=$2 AND period_id IS NULL AND deleted_at IS NULL FOR UPDATE`, id, profileID).Scan(&lockedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrForbidden
+	}
+	if err != nil {
+		return fmt.Errorf("lock personal expense for update: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE public.expenses SET amount_minor=$2, occurred_on=$3, category_id=$4, note=$5, updated_at=now() WHERE id=$1`, id, amount, date, categoryID, note); err != nil {
+		return classifyWriteError(err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE public.expense_splits SET amount_minor=$3 WHERE expense_id=$1 AND user_id=$2`, id, profileID, amount); err != nil {
 		return classifyWriteError(err)
 	}
 	return classifyWriteError(tx.Commit())
@@ -211,9 +243,24 @@ func (s *Store) SoftDeleteExpense(ctx context.Context, session auth.Session, id 
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `SELECT public.soft_delete_expense($1)`, id)
+	var profileID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM public.profiles WHERE auth_user_id=$1 AND deleted_at IS NULL`, session.Principal.UserID).Scan(&profileID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrForbidden
+	}
+	if err != nil {
+		return fmt.Errorf("load caller profile for expense deletion: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE public.expenses SET deleted_at=now(), updated_at=now() WHERE id=$1 AND user_id=$2 AND period_id IS NULL AND deleted_at IS NULL`, id, profileID)
 	if err != nil {
 		return classifyWriteError(err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read soft-delete result: %w", err)
+	}
+	if rows != 1 {
+		return ErrForbidden
 	}
 	return classifyWriteError(tx.Commit())
 }

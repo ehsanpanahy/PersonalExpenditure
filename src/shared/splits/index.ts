@@ -2,12 +2,12 @@
  * Frozen split shares (ARCHITECTURE.md §5.2, §5.4; MODULE_VIEW.md §L3).
  *
  * Pure TypeScript: no React, no Expo, no Supabase. The preview runs locally
- * so typing feels instant; the server re-validates everything in
- * `create_expense()` and rejects mismatches instead of correcting them.
+ * so typing feels instant; the Go API validates the submitted frozen shares
+ * and rejects mismatches instead of correcting them.
  *
- * Rounding conformance: the cases in `./conformance.json` mirror the SQL
- * assertions in `supabase/tests/golden_dataset_test.sql` (§C). Keep them in
- * sync — drift between the preview and the server is a wrong-number bug.
+ * The canonical cases in `./conformance.json` are also checked by Go's
+ * request-validation tests. Postgres independently enforces the persisted
+ * exact-total invariant; it does not implement the rounding rule.
  */
 import { allocateToMembers, type MemberShare } from '../money/allocate';
 

@@ -31,6 +31,10 @@ remain SQL aggregates.
   database trigger enforces the exact split-total invariant. Amounts cross as
   decimal strings. Client-generated `id` values are idempotent (same
   id + same payload returns the id with 201); a conflicting payload is 409.
+- `PUT /v1/expenses/{id}` updates a caller-owned personal expense and its owner
+  split in one transaction. `DELETE /v1/expenses/{id}` soft-deletes the caller's
+  personal expense. Go validates the request and Postgres enforces RLS and the
+  deferred split-total invariant.
 - Expense amounts are returned as decimal strings to preserve Postgres `bigint`
   precision in JavaScript clients.
 - `supabase/migrations/20261014000000_expense_read_schema.sql` creates the
@@ -39,15 +43,14 @@ remain SQL aggregates.
   `expense_splits` table and computed `period_balances`.
 - `supabase/migrations/20261016000000_go_expense_writes.sql` adds the restricted
   API roles, write-specific RLS policies, and deferred split-total checks. The
-  old SQL write RPCs are executable only by `app_api` for the existing pgTAP
-  conformance fixtures; the Go API does not call them, and mobile-authenticated
-  clients cannot use them as an alternate write path.
+  Go API uses direct caller-scoped DML; RLS and deferred integrity checks remain
+  enforced by Postgres. Expense workflows and request validation live in Go.
 - `openapi.yaml` is the API contract; generate mobile API types from it.
 
-This is the backend foundation plus personal expense reads and writes.
-Expense editing/deletion, periods, budgets, reports, and exports remain to be
-designed and implemented. Add each feature as a Go workflow backed by
-caller-scoped transactions, RLS, and database integrity constraints.
+Personal expense reads, writes, edits, soft-deletes, and period workflows are
+implemented as Go API operations backed by caller-scoped transactions, RLS, and
+database integrity constraints. Budgets, reports, and exports remain to be
+implemented as Go workflows with SQL-owned aggregates where applicable.
 
 ## Run locally
 

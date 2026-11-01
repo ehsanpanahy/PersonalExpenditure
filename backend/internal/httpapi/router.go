@@ -28,18 +28,19 @@ func newRouter(verifier auth.Verifier, supabaseClient *supabase.Client, store *p
 	})
 	mux.Handle("GET /v1/me", requireAuth(verifier, logger)(http.HandlerFunc(meHandler)))
 	mux.Handle("GET /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(listPersonalExpenses(supabaseClient, logger))))
-	createHandler := createExpense(supabaseClient, logger)
 	if store != nil {
-		createHandler = createExpenseWithPostgres(store, logger)
-	}
-	mux.Handle("POST /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(createHandler)))
-	if store != nil {
+		mux.Handle("POST /v1/expenses", requireAuth(verifier, logger)(http.HandlerFunc(createExpenseWithPostgres(store, logger))))
 		mux.Handle("PUT /v1/expenses/{id}", requireAuth(verifier, logger)(http.HandlerFunc(updatePersonalExpense(store, logger))))
 		mux.Handle("DELETE /v1/expenses/{id}", requireAuth(verifier, logger)(http.HandlerFunc(softDeleteExpense(store, logger))))
 		mux.Handle("GET /v1/categories", requireAuth(verifier, logger)(http.HandlerFunc(listCategories(store, logger))))
 		mux.Handle("POST /v1/categories", requireAuth(verifier, logger)(http.HandlerFunc(createCategory(store, logger))))
 		mux.Handle("PUT /v1/categories/{id}", requireAuth(verifier, logger)(http.HandlerFunc(updateCategory(store, logger))))
 		mux.Handle("PATCH /v1/categories/{id}/archive", requireAuth(verifier, logger)(http.HandlerFunc(setCategoryArchived(store, logger))))
+		mux.Handle("GET /v1/periods", requireAuth(verifier, logger)(http.HandlerFunc(listPeriods(store, logger))))
+		mux.Handle("POST /v1/periods", requireAuth(verifier, logger)(http.HandlerFunc(createPeriod(store, logger))))
+		mux.Handle("GET /v1/periods/{id}", requireAuth(verifier, logger)(http.HandlerFunc(getPeriod(store, logger))))
+		mux.Handle("PATCH /v1/periods/{id}/manager", requireAuth(verifier, logger)(http.HandlerFunc(transferPeriodManager(store, logger))))
+		mux.Handle("DELETE /v1/periods/{id}", requireAuth(verifier, logger)(http.HandlerFunc(softDeletePeriod(store, logger))))
 	}
 	return mux
 }

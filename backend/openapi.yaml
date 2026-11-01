@@ -146,7 +146,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/CreateExpenseResult'
         '400':
-          description: Invalid expense payload, or the RPC rejected it (split total, dates, membership, currency)
+          description: The Go API rejected an invalid expense payload or application rule (split total, dates, membership, currency)
           content:
             application/json:
               schema:
@@ -312,6 +312,103 @@ paths:
         '400': { description: Invalid archive state }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { description: Category unavailable }
+  /v1/periods:
+    get:
+      operationId: listPeriods
+      summary: List live periods the caller belongs to
+      security: [{ supabaseBearer: [] }]
+      responses:
+        '200':
+          description: Periods visible to the authenticated member
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Period' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '502': { description: Data service unavailable }
+    post:
+      operationId: createPeriod
+      summary: Create a period with a fixed member roster
+      description: >-
+        Member addresses must match existing accounts. The creator is always
+        included as a member. The manager email must identify one of the
+        resulting members. The roster cannot be changed after creation.
+      security: [{ supabaseBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePeriodRequest' }
+      responses:
+        '201':
+          description: Period created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Period' }
+        '400': { description: Invalid period values or member address }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '502': { description: Data service unavailable }
+  /v1/periods/{id}:
+    get:
+      operationId: getPeriod
+      summary: Get a period the caller belongs to
+      security: [{ supabaseBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Period visible to the authenticated member
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Period' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Period unavailable }
+        '502': { description: Data service unavailable }
+    delete:
+      operationId: softDeletePeriod
+      summary: Soft-delete a period as its manager
+      description: Hides the period and its expenses and budgets from all members.
+      security: [{ supabaseBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Period and scoped data are hidden }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Period unavailable to caller }
+        '502': { description: Data service unavailable }
+  /v1/periods/{id}/manager:
+    patch:
+      operationId: transferPeriodManager
+      summary: Transfer manager role to another period member
+      security: [{ supabaseBearer: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [manager_id]
+              properties:
+                manager_id: { type: string, format: uuid }
+      responses:
+        '204': { description: Manager role transferred }
+        '400': { description: Invalid manager id or target is not a member }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Period unavailable to caller }
+        '502': { description: Data service unavailable }
 components:
   securitySchemes:
     supabaseBearer:
@@ -354,6 +451,30 @@ components:
         color: { type: [string, 'null'] }
         sort_order: { type: integer, minimum: 0 }
         is_archived: { type: boolean }
+    Period:
+      type: object
+      required: [id, name, manager_id, starts_on, ends_on, currency]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        manager_id: { type: string, format: uuid }
+        starts_on: { type: string, format: date }
+        ends_on: { type: [string, 'null'], format: date }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+    CreatePeriodRequest:
+      type: object
+      additionalProperties: false
+      required: [name, starts_on, currency, member_emails, manager_email]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        starts_on: { type: string, format: date }
+        ends_on: { type: [string, 'null'], format: date }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        member_emails:
+          type: array
+          maxItems: 199
+          items: { type: string, format: email, maxLength: 254 }
+        manager_email: { type: string, format: email, maxLength: 254 }
     SaveCategoryRequest:
       type: object
       additionalProperties: false

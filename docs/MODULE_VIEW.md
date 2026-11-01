@@ -1,6 +1,6 @@
 # Module View — Developer Guide
 
-Status: agreed design, awaiting implementation. Companion to
+Status: evolving implementation guide. Companion to
 [`REQUIREMENTS.md`](./REQUIREMENTS.md) and [`ARCHITECTURE.md`](./ARCHITECTURE.md).
 
 **Purpose.** This document is the enforcement layer. `REQUIREMENTS.md` says what
@@ -10,8 +10,9 @@ the app must do; `ARCHITECTURE.md` says how the data is shaped; this document sa
 A developer should be able to answer two questions from this document alone:
 *"where do I put this?"* and *"why is that not allowed here?"*
 
-> **Status note.** The project is not scaffolded yet. Every path below is the
-> agreed target, not something that exists today.
+> **Status note.** The project is partially scaffolded. Paths below describe the
+> intended boundaries; check the current repository before assuming a module
+> exists.
 
 ---
 
@@ -23,13 +24,14 @@ Four layers. Each one may only use the layer below it.
 graph TD
     L0["L0 — Routes (app/)<br/>screen composition only"]
     L1["L1 — Features (src/features/&lt;feature&gt;/)<br/>screens, hooks, orchestration"]
-    L2["L2 — Data access (src/db/)<br/>the only code that knows Postgres exists"]
+    L2["L2 — API client (src/api/)<br/>typed client for Go"]
     L3["L3 — Pure domain (src/shared/)<br/>no framework, no database, no React"]
-    L4["L4 — Postgres (supabase/)<br/>the trust boundary — truth lives here"]
+    L4["L4 — Postgres (supabase/)<br/>RLS, persisted integrity, aggregates"]
 
     L0 --> L1
     L1 --> L2
-    L2 --> L4
+    L2 --> Go["Go application API<br/>workflows and authoritative request validation"]
+    Go --> L4
     L1 --> L3
     L3 -.- L4
 
@@ -43,10 +45,10 @@ graph TD
 | --- | --- |
 | R1 | Arrows point down only. Nothing imports upward. |
 | R2 | `src/shared/` imports **nothing** from React, Expo, or Supabase — only itself and the standard library. |
-| R3 | `src/db/` is the **only** module that imports `@supabase/supabase-js`. |
-| R4 | `app/` routes import only `src/features/*` and `src/ui/*`. No `src/db`, no `src/shared`. |
+| R3 | Application data goes through the typed `src/api/` Go API client. Supabase Auth is used only for identity and session management. |
+| R4 | `app/` routes import only `src/features/*` and `src/ui/*`. No `src/api`, no `src/shared`. |
 | R5 | A feature may not import another feature's internals. Only its public `index.ts`. |
-| R6 | Business rules (invariants) live in L4. L3 holds only presentation-side logic. They must agree. |
+| R6 | Go owns application rules and request validation. Postgres owns RLS, constraints, triggers, and aggregates. Client checks only improve UX. |
 
 ### Why these rules exist
 
@@ -56,10 +58,10 @@ prevent one of those:
 
 - **R2** is what makes the money and date logic unit-testable without a phone, a
   simulator, or a database.
-- **R3** means there is exactly one place to audit for the service-role key and
-  session storage, instead of hunting through 40 screens.
-- **R6** is the "two implementations drift" problem. A rule in exactly two
-  places is strictly worse than one place plus a test that proves they agree.
+- **R3** keeps the mobile app away from database tables and prevents a privileged
+  database key from entering client code.
+- **R6** keeps workflow decisions in a testable application layer while database
+  safeguards still protect persisted data if a caller makes a mistake.
 
 ---
 
@@ -67,13 +69,13 @@ prevent one of those:
 
 Read as *row may import column*.
 
-| | L0 routes | L1 features | L2 db | L3 shared | L4 supabase | ui |
+| | L0 routes | L1 features | L2 API | L3 shared | L4 Postgres | ui |
 |---|---|---|---|---|---|---|
 | **L0 routes** | — | ✅ | ❌ | ❌ | ❌ | ✅ |
 | **L1 features** | ❌ | ⚠️ public only | ✅ | ✅ | ❌ | ✅ |
-| **L2 db** | ❌ | ❌ | — | ❌ | ✅ | ❌ |
+| **L2 API** | ❌ | ❌ | — | ❌ | ❌ | ❌ |
 | **L3 shared** | ❌ | ❌ | ❌ | ⚠️ same layer only | ❌ | ❌ |
-| **L4 supabase** | ❌ | ❌ | ❌ | ❌ | — | — |
+| **L4 Postgres** | ❌ | ❌ | ❌ | ❌ | — | — |
 
 ⚠️ = allowed with a restriction, explained in §6.
 
@@ -132,32 +134,27 @@ src/features/<feature>/
 ├─ components/         # local presentational pieces
 ├─ hooks/              # TanStack Query hooks: useX, useCreateX
 ├─ queries.ts          # query keys + read query definitions
-├─ mutations.ts        # write operations, calling L2 RPCs
+├─ mutations.ts        # write operations, calling the Go API
 └─ types.ts            # feature-local view models
 ```
 
 Rule R5 in practice: `src/features/periods/queries.ts` may import
 `../../features/splits` but **never**
 `../../features/splits/queries`. If two features genuinely need the same
-capability, it belongs in `src/shared/` or `src/db/`.
+capability, it belongs in `src/shared/` or the typed `src/api/` client.
 
-### L2 — Data access (`src/db/`)
+### L2 — API client (`src/api/`)
 
-**The only layer that knows Postgres exists.** If a file mentions
-`@supabase/supabase-js`, a table name, or a column name, it lives here.
+The mobile app talks to the Go API for application data. It does not access
+Postgres tables or RPCs directly.
 
 | Module | Responsibility |
 | --- | --- |
-| `client.ts` | Creates the Supabase client. Configures secure session storage. Injects the generated types. |
-| `rpc/expenses.ts` | Typed wrappers around the SQL write functions. |
-| `rpc/balances.ts` | Typed wrappers around the balance and period functions. |
-| `rpc/reports.ts` | Typed wrappers around aggregation views. |
-| `tables/*.ts` | Raw read queries for table records (no caching, no rules). |
-| `types.ts` | **Generated.** `supabase gen types typescript`. Never hand-edited. |
+| `client.ts` | Typed HTTP client for the Go API; attaches the Supabase access token. |
+| `types.ts` | **Generated from `backend/openapi.yaml`.** Never hand-edited. |
 
-`src/db` holds **no validation, no business rules, and no formatting.** It
-translates. A function here has one job: take a typed input, call Postgres,
-return the typed result, and surface a typed error.
+TanStack Query owns API response caching. API request parsing and authoritative
+business validation run in Go; Postgres enforces RLS and persisted integrity.
 
 ### L3 — Pure domain (`src/shared/`)
 
@@ -175,15 +172,17 @@ languages. See §7.
 
 ### L4 — Postgres (`supabase/`)
 
-**The trust boundary. Every invariant is enforced here or nowhere.**
+Postgres is the persisted-data trust boundary. It enforces tenant isolation,
+database invariants, and aggregates. Go owns application workflows and
+authoritative request validation.
 
 | Module | Responsibility |
 | --- | --- |
 | `migrations/` | Ordered schema changes. One concern per file. |
-| `functions/create_expense.sql` | Authorise → validate membership → validate date range → validate split total → insert. All in one transaction. |
+| Constraints, RLS, and triggers | Enforce tenant isolation and persisted invariants such as exact split totals and period-manager consistency. |
 | `functions/period_balances.sql` | Compute paid / owes / net per member. |
 | `functions/expense_totals.sql` | Aggregates for reports and budgets. |
-| `functions/manage_period.sql` | Create period, transfer manager, enforce "last manager cannot leave". |
+| `period write policies and consistency trigger` | Enforce caller-scoped Go writes, fixed roster finalization, and manager consistency at commit. |
 | `tests/rls_test.sql` | Cross-user access must fail. |
 | `tests/golden_dataset_test.sql` | Hand-computed fixtures, exact expected values. |
 | `seed.sql` | Starter categories. |
@@ -209,9 +208,9 @@ sumAmounts(amounts: Minor[], currency: string): Minor       // throws on mixed c
 allocate(amount: Minor, participantIds: string[]): Map<string, number>
 ```
 
-`allocate()` is where money bugs are born, so it is small, pure, and fully
-unit-tested. No other function may implement a rounding rule — one helper, one
-place, no exceptions.
+`allocate()` is the mobile preview's only rounding implementation. Go validates
+the submitted frozen shares and exact total; Postgres checks the persisted sum.
+Whether Go should also compute equal-share rounding remains an open decision.
 
 ### `src/shared/dates`
 
@@ -235,7 +234,7 @@ validateExactShares(amount: Minor, shares: Map<string, number>): string | null
 `freezeShares` is the even split. `validateExactShares` checks that manual
 amounts are non-negative and total exactly the expense amount.
 
-### `src/db/rpc`
+### `src/api` Go API client
 
 ```ts
 createExpense(input: CreateExpenseInput): Promise<Result<string>>    // returns new id
@@ -247,7 +246,8 @@ deleteAccount(): Promise<Result<void>>
 exportUsersData(range: DateRange): Promise<Backup>
 ```
 
-Every write returns a typed `Result`. Failures are never thrown past the hook,
+The client talks only to HTTP endpoints implemented by Go, never database
+functions. Every write returns a typed `Result`. Failures are never thrown past the hook,
 never swallowed, and never represented as a silent empty list.
 
 ### Conventions
@@ -272,13 +272,10 @@ app/expense/new                       # L0: collect nothing, render a screen
   → features/expenses/screens/NewExpenseScreen
       → shared/money.parseAmount      # L3: "24.50" → {minor: 2450} — instant, local
       → features/expenses/mutations.useCreateExpense
-          → db/rpc/expenses.createExpense      # L2 → L4
-              → supabase.functions.create_expense
-                    · authorise: caller is the owner
-                    · amount > 0, currency matches profile
-                    · date is not in the future
-                    · insert expense + exactly one split row (owner, full amount)
-                    · return id
+          → Go API POST /v1/expenses
+              → Go validates caller, payload, ownership, currency, and date
+              → caller-scoped transaction inserts expense + owner split
+              → deferred Postgres trigger verifies the exact split total
           ← Result<id>
       → invalidate ['expenses', userId, month]
   → features/expenses/screens renders the updated month
@@ -297,19 +294,17 @@ app/period/[id]/new
           → shared/splits.freezeShares or validateExactShares   # L3, local, instant
           ⤷ screen shows each member's share before the user saves (FR-5.5)
       → features/expenses/mutations.useCreateExpense
-          → db/rpc/expenses.createExpense
-              → create_expense
-                    · caller is a member of the period
-                    · date within [starts_on, ends_on]   ← reject, never clamp
-                    · every participant is a period member
-                    · every share ≥ 0 AND SUM(shares) == amount
-                    · insert expense + one split row per participant
+          → Go API POST /v1/expenses
+              · Go checks period membership, date range, currency, participants,
+                positive shares, and exact split sum
+              · caller-scoped transaction inserts expense + frozen split rows
+              · deferred Postgres trigger independently enforces exact total
   → invalidate expenses for the period AND period balances
 ```
 
 The preview runs locally so typing feels instant. **The server does not trust
-it.** `create_expense` re-derives and re-validates everything, and a mismatch is
-rejected, not corrected.
+it.** Go re-derives and validates everything, and Postgres independently
+rejects a persisted split set whose sum does not match the expense.
 
 ### 5.3 Show period balances
 
@@ -317,8 +312,8 @@ rejected, not corrected.
 app/period/[id]/balances
   → features/periods/screens/BalancesScreen
       → features/periods/queries usePeriodBalances
-          → db/rpc/balances.periodBalances     # L2 → L4
-              → period_balances(period_id)
+          → Go API GET /v1/periods/{id}/balances
+              → Postgres period_balances aggregate
                     paid  = Σ amount_minor where paid_by = m, not deleted
                     owes  = Σ split.amount_minor where split.user_id = m, not deleted
                     net   = paid − owes
@@ -334,9 +329,9 @@ aggregates anything. The SQL returns final numbers, and the phone renders them.
 
 ### Authentication
 
-`src/features/accounts/` owns the session and exposes `useSession`. `src/db/client.ts`
-is the only place the session is read or written. Screens ask a hook, never a
-store.
+`src/features/accounts/` owns the session and exposes `useSession`. The auth
+adapter is the only place that reads or writes the Supabase session. Screens
+ask a hook, never a store.
 
 ### ⚠️ Clearing state on sign-out — a privacy bug waiting to happen
 
@@ -350,7 +345,7 @@ RLS failing at all — RLS blocks the *database* read, but the cache is outside 
 
 **Required behaviour:** sign-out clears the query cache, resets all feature
 stores, and navigates through a full unmount of the authenticated tree. Same for
-a 401 or session-expiry response from any RPC.
+a 401 or session-expiry response from any API request.
 
 > **Recommendation:** promote this to a hard rule in `AGENTS.md` and add the
 > matching case to the RLS/integration suite. It is a missing precondition, not
@@ -371,10 +366,10 @@ it is allowed to be stale as long as the app *says* it is stale.
 | Origin | Where it is handled | What the user sees |
 | --- | --- | --- |
 | Split doesn't total the amount | L3, before submit | Inline message on the field. **The save button is disabled.** |
-| Expense dated outside the period | L4, on submit | Banner: "Pick a date inside the period." |
-| Date moved by a timezone edge case | L4, on submit | Banner with the accepted range, not a crash. |
+| Expense dated outside the period | Go API, on submit | Banner: "Pick a date inside the period." |
+| Date moved by a timezone edge case | Go API, on submit | Banner with the accepted range, not a crash. |
 | No connection | Hook, before the call | "You're offline — reconnect to save." |
-| Not authorised | L4, RLS or the write function | Treated as "not found": never reveal that a record exists. |
+| Not authorised | Go API or Postgres RLS | Treated as "not found": never reveal that a record exists. |
 
 **RLS denials must be indistinguishable from "does not exist."** That is
 deliberate — the alternative tells an attacker which IDs are real.
@@ -389,16 +384,16 @@ this rule live?"*, this is the answer.
 | Invariant | Enforced in | Tested by |
 | --- | --- | --- |
 | Amounts are integer minor units | `shared/money` types + schema columns | Unit: money suite |
-| No negative amounts | `CHECK` + `create_expense` | pgTAP |
+| No negative amounts | Schema `CHECK` + Go request validation | pgTAP + Go tests |
 | Dates are plain `date`, no timezone | Schema | Golden dataset |
 | Month boundaries never in UTC | `shared/dates` + callers passing `(from, to)` | Unit: DST case in dates suite |
-| Split shares sum to the expense | `create_expense` | pgTAP conformance fixtures |
+| Split shares sum to the expense | Go validation + deferred Postgres integrity trigger | pgTAP + Go tests |
 | Splits frozen at creation | Schema: computed columns, stored values | Golden dataset (roster change) |
-| Participants must be period members | `create_expense` | pgTAP |
-| Expense date inside the period range | `create_expense` | pgTAP |
-| Deterministic rounding remainder | SQL **and** `shared/splits` | Conformance fixtures in **both** suites |
-| Exactly one manager per period | Partial unique index | pgTAP |
-| The last manager cannot leave | `manage_period` | pgTAP |
+| Participants must be period members | Go workflow + RLS boundary | Go tests + pgTAP |
+| Expense date inside the period range | Go workflow | Go tests |
+| Deterministic rounding remainder | `shared/splits` preview; Go accepts validated frozen shares | Canonical fixture in Jest and Go validation tests |
+| Exactly one matching manager per live period | Partial unique index + deferred consistency trigger | pgTAP |
+| The last manager cannot leave | Go account-deletion workflow + database integrity | pgTAP |
 | No user can see another's data | RLS on every table | RLS suite (outsider reads zero rows) |
 | Balances are computed, never stored | `period_balances` only | Golden dataset (edit, delete, re-add) |
 | Personal and shared money never merge | Report/budget scopes | Golden dataset |
@@ -409,20 +404,20 @@ this rule live?"*, this is the answer.
 
 ## 8. The split-rounding duplication (open decision)
 
-The rounding rule (`BR-2`) must exist in two places: SQL, because the server
-validates; and `shared/splits`, because the preview must be instant while
-typing. **Two implementations of a rounding rule will drift.**
+The mobile preview applies the deterministic remainder rule. Go currently
+validates the submitted frozen shares and exact total, but does not recompute
+that rule. Decide whether Go should also calculate equal shares or keep the
+rounding implementation in the mobile preview only.
 
 This is still undecided — see `AGENTS.md`, Open decisions. The module view
 assumes option A:
 
 **A. Keep both, with a shared conformance fixture.**
-`shared/splits/freezeShares` handles previews; SQL is authoritative; one JSON
-fixture drives assertions in both the Jest and pgTAP suites, so drift fails CI.
+`shared/splits/freezeShares` handles previews and Go computes the same values;
+one JSON fixture drives assertions in Jest and Go tests, so drift fails CI.
 
-**B. SQL only.** The screen calls an RPC for a live preview, so `shared/splits`
-does not exist. Modules affected: `shared/splits/*` deleted, the split editor
-gains a loading state, and one round-trip per keystroke continues.
+**B. Go only.** Remove the TypeScript rounding copy and preview shares from the
+Go API. The editor would need a loading state and a server request to preview.
 
 > Modules affected by reversing this: `shared/splits/`, `features/splits/`,
 > and one entry in the ENFORCED column of §7.
@@ -457,7 +452,7 @@ a matter of taste.
    amount crossing a boundary is `{minor, currency}`, not a bare number.
 9. **`moment` / `date-fns-tz` / a hand-rolled offset** installed to fix one date
    bug. Month ranges come from the `timeZone` database column, via `monthRange`.
-10. **Hand-editing `src/db/types.ts` to make an error go away.** It is generated.
+10. **Hand-editing `src/api/types.ts` to make an error go away.** It is generated.
     Fix the schema, regenerate, commit.
 
 ---
@@ -467,12 +462,12 @@ a matter of taste.
 A developer starting cold should build in this order. Each step is shippable and
 testable at the boundary.
 
-1. **L4 first.** Schema, RLS policies, `create_expense`, `period_balances`,
-   `expense_totals`, `manage_period`. Write `rls_test.sql` and the golden
+1. **L4 first.** Schema, RLS policies, integrity triggers, `period_balances`,
+   and `expense_totals`. Implement expense and period workflows in Go. Write `rls_test.sql` and the golden
    dataset *before* any screen exists.
 2. **L3.** `money`, `dates`, `splits` with unit tests. Pure and fast, no
    scaffolding required.
-3. **L2.** Generate types, write the RPC wrappers.
+3. **L2.** Generate API types from OpenAPI and implement the typed Go API client.
 4. **`accounts` feature**, so there is something to log into.
 5. **`categories` + seeding**, so an expense can be recorded.
 6. **`expenses`** — the core loop.

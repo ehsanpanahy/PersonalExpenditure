@@ -73,7 +73,8 @@ one of these, the change needs an explicit decision.
 ### 2.2 Personal expenses
 
 - Create / edit / soft-delete an expense: amount, date, category, optional note.
-  Amount edits rewrite the single owner split in the same RPC.
+  The Go API updates the expense and its owner split in one caller-scoped
+  transaction; Postgres checks the final split total at commit.
 - Flat categories per user (seeded, editable, reorderable, archivable).
 - Browse and filter: by month, by category, text search on note.
 - Monthly budgets: personal (whole-scope or per category) or period
@@ -84,9 +85,14 @@ one of these, the change needs an explicit decision.
 
 - A Period has a name, a manager, a start date, and an optional end date
   (`NULL` = ongoing).
-- **Fixed roster.** Members are added when the Period is created, by exact
-  email match inside `create_period()` — never by listing `profiles`. There is
-  no invite, join, or accept flow in v1.
+- **Fixed roster.** Go resolves the supplied emails through a narrow database
+  lookup and creates the period and its members in one `app_api` transaction.
+  Go validates the request, including email syntax, list size, and duplicates.
+  The SQL helper only maps those exact requested addresses to confirmed accounts
+  with live profiles; it cannot list profiles or decide whether the roster is
+  valid. A database `roster_finalized` marker, RLS policies, and a deferred
+  trigger protect the fixed roster and manager invariant at commit. There is no
+  invite, join, or accept flow in v1.
 - Any member can create an expense in the Period.
 - Author chooses how each expense is divided: equal among everyone by default,
   or exclude specific members (omit a split row), or type exact amounts per
@@ -277,18 +283,21 @@ Indexes: unique `(user_id, lower(name))`; `(user_id, sort_order)`.
 | --- | --- | --- |
 | `id` | `uuid` PK | |
 | `name` | `text` | |
-| `manager_id` | `uuid` | → `profiles(id)` — denormalised cache of the manager. `period_members.role` is authoritative. `transfer_manager()` updates both in one transaction. |
+| `manager_id` | `uuid` | → `profiles(id)` — denormalised cache of the manager. `period_members.role` is authoritative. Go updates both in one transaction; a deferred database trigger checks they match. |
 | `starts_on` | `date` | |
 | `ends_on` | `date` | nullable — `NULL` means ongoing |
 | `currency` | `char(3)` | single currency for the whole period |
+| `roster_finalized` | `bool` | false only while Go creates the fixed roster in the same transaction; RLS rejects later membership inserts |
 | `deleted_at` | `timestamptz` | nullable — manager-deleted period (FR-4.8) |
 | `created_at` / `updated_at` | `timestamptz` | |
 
 Check: `ends_on IS NULL OR ends_on >= starts_on`.
 
-The partial unique index on `period_members` gives **at most** one manager.
-`create_period()` requires **at least** one. Together: exactly one live manager
-on a live period.
+The partial unique index on `period_members` gives **at most** one manager. A
+deferred database trigger requires exactly one manager whose id matches
+`periods.manager_id` when a live period transaction commits. Go creates the
+period with the caller as temporary manager, adds the fixed roster, finalizes
+it, then transfers the manager role if needed—all in one transaction.
 
 #### `period_members`
 | Column | Type | Notes |
@@ -391,14 +400,25 @@ the app never blocks recording an expense.
 
 ### 5.2 Application rules (Go) and database enforcement
 
-Application workflows and request validation live in Go. Postgres functions
-remain appropriate for RLS helpers and aggregate queries; database constraints,
-grants, policies, and triggers protect persisted integrity. `app_api` is a
+Application workflows and all authoritative request validation live in Go.
+That includes validating fields and lists, checking business rules, choosing
+the workflow, and returning application errors. Postgres functions must not be
+used as alternate write workflows or as a second implementation of request
+validation. A narrowly scoped SQL lookup is acceptable when Go cannot safely
+read protected identity data directly: it returns only rows matching the
+caller-supplied keys and does not decide whether the request is valid.
+
+Postgres functions remain appropriate for RLS helpers, narrowly scoped lookups,
+and aggregate queries. Database constraints, grants, policies, and triggers
+protect persisted integrity and tenant isolation; they may reject invalid
+database state even when Go has already checked the request. `app_api` is a
 non-login role that inherits the authenticated user's permitted reads and has
-narrow expense/split insert grants. A separate `app_api_login` role is
+narrow expense/split write grants. A separate `app_api_login` role is
 provisioned with a secret outside migrations and can only assume `app_api`.
-RLS helpers such as `is_live_period_member(uid, pid)` remain database functions
-to avoid recursive policy checks.
+RLS helpers such as `is_live_period_member(pid)` remain database functions
+to avoid recursive policy checks. `resolve_period_member_emails(text[])` is the
+period-creation lookup exception: Go validates the emails and roster rules;
+SQL only resolves those requested emails to confirmed, live profiles.
 
 #### Expense writes (Go workflow + Postgres safeguards)
 `POST /v1/expenses` is implemented in `backend/internal/postgres/expenses.go`.
@@ -415,13 +435,12 @@ idempotency. RLS limits rows visible to the caller. The mobile-facing
 `authenticated` role has no expense/split write grants. A deferred trigger
 rejects an expense with no splits or a mismatched sum at transaction commit.
 
-Future update, soft-delete, period, budget, and account workflows belong in Go
-and must use equivalent caller-scoped transactions. Database constraints and
-RLS remain enforcement safeguards. The old SQL write RPCs are executable only
-by `app_api` for existing pgTAP conformance fixtures; the Go API does not call
-them and mobile-authenticated clients cannot use them as an alternate write
-path. Remove those legacy functions when the fixtures migrate to direct
-seed/setup plus Go API assertions.
+Personal expense update and soft-delete, and period workflows, use Go
+caller-scoped transactions. Budget and account workflows also belong in Go
+when implemented. Expense SQL write RPCs have been removed. pgTAP directly
+seeds valid ledger rows and tests database-owned integrity and aggregates; Go
+tests cover request validation and workflow behavior. New workflows must not
+add SQL RPCs that perform application validation or orchestrate writes.
 
 #### `expense_totals(scope, from, to)`
 Report aggregates. Scope is `('user', user_id)` or `('period', period_id)`.

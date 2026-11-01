@@ -22,6 +22,15 @@ func (f verifierFunc) Verify(ctx context.Context, token string) (auth.Principal,
 	return f(ctx, token)
 }
 
+func testVerifier() verifierFunc {
+	return verifierFunc(func(_ context.Context, token string) (auth.Principal, error) {
+		if token != "access-token" {
+			return auth.Principal{}, auth.ErrInvalidToken
+		}
+		return auth.Principal{UserID: "verified-user"}, nil
+	})
+}
+
 func TestRouterHealthzIsPublic(t *testing.T) {
 	verifier := verifierFunc(func(context.Context, string) (auth.Principal, error) {
 		t.Fatal("verifier called for public health route")

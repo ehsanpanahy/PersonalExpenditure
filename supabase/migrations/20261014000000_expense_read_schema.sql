@@ -1,5 +1,6 @@
 -- Initial database slice for authenticated expense reads.
--- Writes remain disabled until the SQL RPCs and their validation are added.
+-- Application writes are implemented by the Go API in a caller-scoped
+-- transaction; this migration establishes the schema and read policies.
 
 CREATE TYPE public.period_role AS ENUM ('manager', 'member');
 
